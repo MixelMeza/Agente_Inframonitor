@@ -353,7 +353,14 @@ public class InfraMonitorAgent {
         conn.setReadTimeout(timeoutMs);
         conn.setRequestMethod(method);
         conn.setInstanceFollowRedirects(true);
-        return conn.getResponseCode();
+        try {
+            return conn.getResponseCode();
+        } finally {
+            try {
+                if (conn.getInputStream() != null) conn.getInputStream().close();
+            } catch (Exception ignored) {}
+            conn.disconnect();
+        }
     }
 
 
