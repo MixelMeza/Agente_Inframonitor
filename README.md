@@ -98,3 +98,35 @@ systemctl start inframonitor-agent
 | TCP | Socket connect to host:port |
 | HTTP | HEAD request, checks HTTP 2xx/3xx |
 | DNS | DNS resolution of hostname |
+
+## Recompilation and Release (Developers)
+
+To compile the agent code and update the jar file under the `releases/` directory (so it can be pushed to Git):
+
+- **Windows**:
+  ```cmd
+  .\release.bat
+  ```
+- **Linux / macOS**:
+  ```bash
+  chmod +x release.sh
+  ./release.sh
+  ```
+
+This will run Maven using the bundled wrapper, build the project, and overwrite `releases/inframonitor-agent.jar`.
+
+## Auto-Updating the Agent (Remote Host)
+
+Since the agent is stateless (the backend keeps all logs and settings), updating is simply downloading the new JAR and restarting. You can update a running agent with a single command:
+
+- **Linux / macOS**:
+  ```bash
+  curl -s -L https://raw.githubusercontent.com/MixelMeza/Agente_Inframonitor/main/releases/update-agent.sh | bash
+  ```
+- **Windows (PowerShell)**:
+  ```powershell
+  irm https://raw.githubusercontent.com/MixelMeza/Agente_Inframonitor/main/releases/update-agent.ps1 | iex
+  ```
+
+These scripts will auto-detect the installation path, download the new JAR from Git, stop any running agent process, replace the old JAR, and restart if running under systemd.
+
