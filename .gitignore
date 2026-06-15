@@ -1,0 +1,7 @@
+target/
+.idea/
+.vscode/
+*.class
+*.jar
+!releases/
+!releases/*.jar
