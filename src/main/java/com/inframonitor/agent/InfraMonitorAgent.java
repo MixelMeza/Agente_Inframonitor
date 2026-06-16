@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +45,7 @@ public class InfraMonitorAgent {
 
     private static SSLSocketFactory trustAllSocketFactory;
     private static HostnameVerifier trustAllHostnameVerifier;
+    private static final ExecutorService checkExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     static {
         try {
@@ -132,7 +134,9 @@ public class InfraMonitorAgent {
                             try {
                                 WebSocket w = wsRef.get();
                                 if (w != null) {
-                                    w.sendText("{\"type\":\"HEARTBEAT\"}", true);
+                                    synchronized (w) {
+                                        w.sendText("{\"type\":\"HEARTBEAT\"}", true);
+                                    }
                                 }
                             } catch (Exception e) {
                                 latch.countDown();
@@ -147,7 +151,7 @@ public class InfraMonitorAgent {
                         if (last) {
                             String msg = messageBuffer.toString();
                             messageBuffer.setLength(0);
-                            handleMessage(webSocket, msg, agentName);
+                            checkExecutor.submit(() -> handleMessage(webSocket, msg, agentName));
                         }
                         return null;
                     }
@@ -215,7 +219,9 @@ public class InfraMonitorAgent {
                 result.message.replace("\"", "'").replace("\n", " ")
         );
 
-        ws.sendText(response, true);
+        synchronized (ws) {
+            ws.sendText(response, true);
+        }
         log("Result: " + result.status + " (" + result.latencyMs + "ms) " + result.message);
     }
 
