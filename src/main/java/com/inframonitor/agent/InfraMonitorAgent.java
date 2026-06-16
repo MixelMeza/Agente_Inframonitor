@@ -270,14 +270,9 @@ public class InfraMonitorAgent {
     }
 
     private static boolean pingHost(String target, int timeoutMs) {
-        try {
-            InetAddress addr = InetAddress.getByName(target);
-            if (addr.isReachable(timeoutMs)) {
-                return true;
-            }
-        } catch (Exception ignored) {}
-
-        // Fallback to system ping command
+        // We bypass InetAddress.isReachable because it defaults to TCP port 7 when
+        // privileges are missing, which drops packets and blocks for the full timeout
+        // (e.g. 15 seconds) before failing. System ping is much faster and reliable.
         try {
             boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
             ProcessBuilder pb;
