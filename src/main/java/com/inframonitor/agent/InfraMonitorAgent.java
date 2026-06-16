@@ -318,20 +318,28 @@ public class InfraMonitorAgent {
         // We bypass InetAddress.isReachable because it defaults to TCP port 7 when
         // privileges are missing, which drops packets and blocks for the full timeout
         // (e.g. 15 seconds) before failing. System ping is much faster and reliable.
+        //
+        // DNS Resolution: Always done by the agent using local /etc/resolv.conf or system resolver.
+        // This allows the agent to use DNS from its own network environment, not the backend's.
         try {
             boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
             ProcessBuilder pb;
             if (isWindows) {
-                // Windows: -n is count, default no reverse DNS
+                // Windows: -n is count, -w is timeout in milliseconds. No reverse DNS by default.
                 pb = new ProcessBuilder("ping", "-n", "1", "-w", String.valueOf(timeoutMs), target);
             } else {
-                // Linux/Mac: -c is count, -W is timeout. IMPORTANT: -n disables reverse DNS lookup,
-                // without -n, ping might block for 5-10s doing a PTR lookup even if the host replies in 5ms.
-                int timeoutSec = Math.max(1, timeoutMs / 1000);
-                pb = new ProcessBuilder("ping", "-n", "-c", "1", "-W", String.valueOf(timeoutSec), target);
+                // Linux/Mac: -c is count, -W is timeout in milliseconds (on most modern systems).
+                // IMPORTANT: -n disables reverse DNS lookup; without it, ping might block 5-10s 
+                // doing a PTR lookup even if the host replies in 5ms.
+                // Note: Java's process.waitFor() provides the hard timeout guarantee; -W is just 
+                // a safety net to prevent ping hanging if the host is unreachable.
+                pb = new ProcessBuilder("ping", "-n", "-c", "1", "-W", String.valueOf(timeoutMs), target);
             }
             Process process = pb.start();
             boolean finished = process.waitFor(timeoutMs + 1000, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+            }
             return finished && process.exitValue() == 0;
         } catch (Exception e) {
             return false;

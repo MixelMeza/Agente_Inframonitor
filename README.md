@@ -99,6 +99,29 @@ systemctl start inframonitor-agent
 | HTTP | HEAD request, checks HTTP 2xx/3xx |
 | DNS | DNS resolution of hostname |
 
+## DNS Resolution
+
+**Important**: All DNS resolution happens **on the agent host** using its local `/etc/resolv.conf` or system resolver. 
+
+This means:
+- ✓ **Agent can reach internal networks** that the backend cannot
+- ✓ **Agent uses its own DNS environment** (internal DNS servers, split-DNS, etc.)
+- ✓ **Agent behaves like a "remote console"** — it can ping/check anything visible from its network
+
+**For Backend→Agent protocol**: The backend **always sends hostnames** (not resolved IPs) to the agent. The agent resolves them locally. Example:
+
+```json
+{
+  "type": "CHECK",
+  "monitorType": "PING",
+  "target": "internal-db.company.local",   ← Backend sends hostname
+  "port": 5432,
+  "timeoutMs": 5000
+}
+```
+
+The agent will use its `/etc/resolv.conf` (or Windows DNS settings) to resolve `internal-db.company.local`, which the backend may not even be able to resolve.
+
 ## Recompilation and Release (Developers)
 
 To compile the agent code and update the jar file under the `releases/` directory (so it can be pushed to Git):
