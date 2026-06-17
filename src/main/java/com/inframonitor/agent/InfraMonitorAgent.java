@@ -15,6 +15,7 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -78,9 +79,13 @@ public class InfraMonitorAgent {
 
     private static SSLSocketFactory trustAllSocketFactory;
     private static HostnameVerifier trustAllHostnameVerifier;
-    // Java 17 compatible: newCachedThreadPool creates threads on-demand for I/O-bound work
+    // Bounded pool: each check spawns an OS process (ping/etc.) on top of the thread, so an
+    // unbounded cached pool could spawn unbounded processes if many checks arrive at once
+    // (e.g. backend dispatching a burst after a reconnect). Capped at 64 concurrent checks;
+    // excess work queues rather than spawning unbounded threads/processes.
     // (Virtual threads would be ideal on Java 21+, but we target 17)
-    private static final ExecutorService checkExecutor = Executors.newCachedThreadPool();
+    private static final ExecutorService checkExecutor = new ThreadPoolExecutor(
+            8, 64, 60L, TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>());
 
     static {
         try {
@@ -275,10 +280,10 @@ public class InfraMonitorAgent {
         try {
             return switch (monitorType != null ? monitorType.toUpperCase() : "") {
                 case "PING" -> {
-                    boolean ok = pingHost(target, timeoutMs);
-                    long latency = System.currentTimeMillis() - start;
-                    yield new CheckResult(ok ? "UP" : "DOWN", latency,
-                            ok ? "PING OK (" + latency + "ms)" : "Host unreachable");
+                    long rtt = pingHost(target, timeoutMs);
+                    boolean ok = rtt >= 0;
+                    yield new CheckResult(ok ? "UP" : "DOWN", ok ? rtt : 0,
+                            ok ? "PING OK (" + rtt + "ms)" : "Host unreachable / timeout");
                 }
                 case "TCP" -> {
                     int p = port != null ? port : 80;
@@ -317,28 +322,43 @@ public class InfraMonitorAgent {
         } catch (java.net.SocketTimeoutException e) {
             long latency = System.currentTimeMillis() - start;
             return new CheckResult("DOWN", latency, "Timeout after " + latency + "ms");
+        } catch (java.net.UnknownHostException e) {
+            // The agent always resolves DNS using its own network/resolver (not the backend's).
+            // This means the host could not be resolved from the agent's network — surface that
+            // clearly instead of the raw exception name, which reads confusingly as "needs DNS".
+            long latency = System.currentTimeMillis() - start;
+            return new CheckResult("DOWN", latency,
+                    "No se pudo resolver el host '" + target + "' usando el DNS del agente");
         } catch (Exception e) {
             long latency = System.currentTimeMillis() - start;
             return new CheckResult("DOWN", latency, e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
-    private static boolean pingHost(String target, int timeoutMs) {
-        // We bypass InetAddress.isReachable because it defaults to TCP port 7 when
-        // privileges are missing, which drops packets and blocks for the full timeout
-        // (e.g. 15 seconds) before failing. System ping is much faster and reliable.
-        //
-        // DNS Resolution: Always done by the agent using local /etc/resolv.conf or system resolver.
-        // This allows the agent to use DNS from its own network environment, not the backend's.
-        //
-        // CRITICAL FIX for reverse DNS (PTR) lookups that can add 3-8 seconds:
-        // - Explicitly disable PTR lookups with appropriate flags per platform
-        // - Use Java timeout as the hard limit (not the OS ping timeout)
-        
+    // Matches "time=12ms" / "time<1ms" / "tiempo=12ms" / "tiempo<1ms" (Windows EN/ES)
+    // and "time=12.3 ms" (Linux/Mac).
+    private static final java.util.regex.Pattern PING_RTT_PATTERN = java.util.regex.Pattern.compile(
+            "(?i)(?:time|tiempo)[=<]\\s*([\\d.]+)\\s*ms");
+
+    /**
+     * Returns the real round-trip time in ms to the target, or -1 if unreachable/timeout.
+     * We bypass InetAddress.isReachable because it defaults to TCP port 7 when
+     * privileges are missing, which drops packets and blocks for the full timeout
+     * before failing. System ping is much faster and reliable.
+     *
+     * DNS Resolution: Always done by the agent using local /etc/resolv.conf or system resolver.
+     * This allows the agent to use DNS from its own network environment, not the backend's.
+     *
+     * The latency reported is parsed from the ping output's real RTT ("time=Xms"),
+     * not the wall-clock time of the whole process (which includes process spawn,
+     * DNS resolution and OS scheduling overhead and is not representative of the
+     * actual network latency to the target).
+     */
+    private static long pingHost(String target, int timeoutMs) {
         try {
             boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
             ProcessBuilder pb;
-            
+
             if (isWindows) {
                 // Windows: -n (count), -w (timeout ms), -4 (IPv4 only, speeds up resolution)
                 pb = new ProcessBuilder("ping", "-n", "1", "-w", String.valueOf(timeoutMs), "-4", target);
@@ -349,28 +369,44 @@ public class InfraMonitorAgent {
                 // - -W: timeout in SECONDS (convert from ms)
                 // - -4: IPv4 only (faster)
                 // Some systems may not support all flags, but they're additive/safe to ignore.
-                
+
                 int timeoutSec = Math.max(1, (timeoutMs + 500) / 1000);  // Round up
                 pb = new ProcessBuilder("ping", "-c", "1", "-n", "-W", String.valueOf(timeoutSec), "-4", target);
             }
-            
+
+            pb.redirectErrorStream(true);
             Process process = pb.start();
+            String output = new String(process.getInputStream().readAllBytes());
+
             // Java's waitFor() is the actual timeout guarantee (not the OS ping flags).
             boolean finished = process.waitFor(timeoutMs + 1000, TimeUnit.MILLISECONDS);
-            
+
             if (!finished) {
                 process.destroyForcibly();
-                return false;  // Timeout exceeded
+                return -1;  // Timeout exceeded
             }
-            
+
             int exitCode = process.exitValue();
-            return exitCode == 0;
+            // Require both exit code 0 AND a TTL in the response — on Windows, "ping"
+            // can return 0 even for "Destination host unreachable" replies.
+            boolean hasTtl = output.toLowerCase().contains("ttl=");
+            if (exitCode != 0 || !hasTtl) {
+                return -1;
+            }
+
+            java.util.regex.Matcher m = PING_RTT_PATTERN.matcher(output);
+            if (m.find()) {
+                return (long) Double.parseDouble(m.group(1));
+            }
+            // TTL present but couldn't parse RTT (unexpected format) — treat as 0ms rather
+            // than fabricating a number from wall-clock time.
+            return 0;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return false;
+            return -1;
         } catch (Exception e) {
             // DNS resolution failed, network error, etc.
-            return false;
+            return -1;
         }
     }
 
@@ -423,6 +459,10 @@ public class InfraMonitorAgent {
                 }
             } catch (Exception ex) {
                 long latency = System.currentTimeMillis() - start;
+                if (e instanceof java.net.UnknownHostException) {
+                    return new CheckResult("DOWN", latency,
+                            "No se pudo resolver el host de '" + rawUrl + "' usando el DNS del agente");
+                }
                 return new CheckResult("DOWN", latency, e.getClass().getSimpleName() + ": " + e.getMessage());
             }
         }
