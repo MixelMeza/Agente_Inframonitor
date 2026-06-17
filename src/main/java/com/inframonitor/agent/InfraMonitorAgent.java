@@ -43,13 +43,16 @@ public class InfraMonitorAgent {
     private static final String VERSION = "1.0.0";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
-    private static final int MAX_TIMEOUT_MS = 10000;
+    private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
 
     /**
      * C: Adaptive timeout — tracks the exponential moving average (EMA) of latency
-     * per target. The effective timeout = max(MIN_TIMEOUT, avg * 3), capped at MAX_TIMEOUT.
-     * Services that respond fast (e.g. 30ms) get a tight 2s timeout so DOWN is detected
-     * in 2s instead of 5s. Services that are legitimately slow (e.g. 2s) get 6–10s.
+     * per target. The effective timeout = avg + 3s (not 3x multiplier), capped at MAX_TIMEOUT.
+     * This prevents DNS or network hiccups from snowballing into huge timeouts.
+     * 
+     * Example:
+     * - Fast service (20ms latency): avg + 3s = 3.02s
+     * - Slow service (2s latency): avg + 3s = 5s
      */
     private static final java.util.concurrent.ConcurrentHashMap<String, Long> avgLatencyByTarget
             = new java.util.concurrent.ConcurrentHashMap<>();
@@ -57,7 +60,11 @@ public class InfraMonitorAgent {
     private static int adaptiveTimeout(String target, int requestedTimeoutMs) {
         Long avg = avgLatencyByTarget.get(target);
         if (avg == null || avg <= 0) return requestedTimeoutMs; // no history yet
-        int adaptive = (int) Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, avg * 3));
+        
+        // Add 3 seconds buffer instead of multiplying (prevents exponential growth)
+        int adaptive = (int) (avg + 3000);
+        adaptive = Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, adaptive));
+        
         // Use the smaller of adaptive vs requested (backend may cap it already)
         return Math.min(adaptive, requestedTimeoutMs);
     }
@@ -71,7 +78,9 @@ public class InfraMonitorAgent {
 
     private static SSLSocketFactory trustAllSocketFactory;
     private static HostnameVerifier trustAllHostnameVerifier;
-    private static final ExecutorService checkExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    // Java 17 compatible: newCachedThreadPool creates threads on-demand for I/O-bound work
+    // (Virtual threads would be ideal on Java 21+, but we target 17)
+    private static final ExecutorService checkExecutor = Executors.newCachedThreadPool();
 
     static {
         try {
@@ -321,27 +330,46 @@ public class InfraMonitorAgent {
         //
         // DNS Resolution: Always done by the agent using local /etc/resolv.conf or system resolver.
         // This allows the agent to use DNS from its own network environment, not the backend's.
+        //
+        // CRITICAL FIX for reverse DNS (PTR) lookups that can add 3-8 seconds:
+        // - Explicitly disable PTR lookups with appropriate flags per platform
+        // - Use Java timeout as the hard limit (not the OS ping timeout)
+        
         try {
             boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
             ProcessBuilder pb;
+            
             if (isWindows) {
-                // Windows: -n is count, -w is timeout in milliseconds. No reverse DNS by default.
-                pb = new ProcessBuilder("ping", "-n", "1", "-w", String.valueOf(timeoutMs), target);
+                // Windows: -n (count), -w (timeout ms), -4 (IPv4 only, speeds up resolution)
+                pb = new ProcessBuilder("ping", "-n", "1", "-w", String.valueOf(timeoutMs), "-4", target);
             } else {
-                // Linux/Mac: -c is count, -W is timeout in milliseconds (on most modern systems).
-                // IMPORTANT: -n disables reverse DNS lookup; without it, ping might block 5-10s 
-                // doing a PTR lookup even if the host replies in 5ms.
-                // Note: Java's process.waitFor() provides the hard timeout guarantee; -W is just 
-                // a safety net to prevent ping hanging if the host is unreachable.
-                pb = new ProcessBuilder("ping", "-n", "-c", "1", "-W", String.valueOf(timeoutMs), target);
+                // Linux/Mac: Prevent slow PTR (reverse DNS) lookups
+                // - -c: count
+                // - -n: disable name resolution (critical!)
+                // - -W: timeout in SECONDS (convert from ms)
+                // - -4: IPv4 only (faster)
+                // Some systems may not support all flags, but they're additive/safe to ignore.
+                
+                int timeoutSec = Math.max(1, (timeoutMs + 500) / 1000);  // Round up
+                pb = new ProcessBuilder("ping", "-c", "1", "-n", "-W", String.valueOf(timeoutSec), "-4", target);
             }
+            
             Process process = pb.start();
+            // Java's waitFor() is the actual timeout guarantee (not the OS ping flags).
             boolean finished = process.waitFor(timeoutMs + 1000, TimeUnit.MILLISECONDS);
+            
             if (!finished) {
                 process.destroyForcibly();
+                return false;  // Timeout exceeded
             }
-            return finished && process.exitValue() == 0;
+            
+            int exitCode = process.exitValue();
+            return exitCode == 0;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         } catch (Exception e) {
+            // DNS resolution failed, network error, etc.
             return false;
         }
     }
