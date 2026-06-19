@@ -41,7 +41,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.0";
+    private static final String VERSION = "1.0.1";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -120,6 +120,16 @@ public class InfraMonitorAgent {
             else if (arg.startsWith("--key="))        apiKey = arg.substring(6);
             else if (arg.startsWith("--heartbeat="))  heartbeatSec = Integer.parseInt(arg.substring(12));
             else if (arg.startsWith("--reconnect-delay=")) reconnectDelaySec = Integer.parseInt(arg.substring(18));
+            else if (arg.startsWith("--test-ping=")) {
+                String target = arg.substring(12);
+                long rtt = pingHost(target, DEFAULT_TIMEOUT_MS);
+                if (rtt >= 0) {
+                    System.out.println("PING " + target + " OK: " + rtt + "ms");
+                    System.exit(0);
+                }
+                System.err.println("PING " + target + " failed or timed out");
+                System.exit(2);
+            }
         }
 
         if (serverUrl == null || agentName == null || apiKey == null) {
@@ -241,6 +251,7 @@ public class InfraMonitorAgent {
 
         Integer port    = (portStr != null && !portStr.equals("null")) ? Integer.parseInt(portStr) : null;
         int requestedTimeout = (toStr != null && !toStr.equals("null")) ? Integer.parseInt(toStr) : DEFAULT_TIMEOUT_MS;
+        requestedTimeout = Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, requestedTimeout));
         // C: Use adaptive timeout based on historical latency for this target
         int timeoutMs = adaptiveTimeout(target != null ? target : "", requestedTimeout);
 
@@ -376,16 +387,16 @@ public class InfraMonitorAgent {
 
             pb.redirectErrorStream(true);
             Process process = pb.start();
-            String output = new String(process.getInputStream().readAllBytes());
 
             // Java's waitFor() is the actual timeout guarantee (not the OS ping flags).
             boolean finished = process.waitFor(timeoutMs + 1000, TimeUnit.MILLISECONDS);
-
             if (!finished) {
                 process.destroyForcibly();
+                process.waitFor(500, TimeUnit.MILLISECONDS);
                 return -1;  // Timeout exceeded
             }
 
+            String output = new String(process.getInputStream().readAllBytes());
             int exitCode = process.exitValue();
             // Require both exit code 0 AND a TTL in the response — on Windows, "ping"
             // can return 0 even for "Destination host unreachable" replies.

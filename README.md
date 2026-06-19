@@ -94,10 +94,21 @@ systemctl start inframonitor-agent
 
 | Type | What it does |
 |------|-------------|
-| PING | `InetAddress.isReachable()` |
+| PING | Executes the operating-system `ping` command and reports the parsed RTT (`time=...ms` / `tiempo=...ms`) |
 | TCP | Socket connect to host:port |
 | HTTP | HEAD request, checks HTTP 2xx/3xx |
 | DNS | DNS resolution of hostname |
+
+## Verify Real Ping Latency
+
+Run this on the same machine where the agent is installed:
+
+```bash
+java -jar inframonitor-agent.jar --test-ping=8.8.8.8
+```
+
+The value printed by the agent must match the local console ping RTT. If the console
+shows ~33 ms, the agent should also report ~33 ms, not the timeout value.
 
 ## DNS Resolution
 
@@ -152,4 +163,3 @@ Since the agent is stateless (the backend keeps all logs and settings), updating
   ```
 
 These scripts will auto-detect the installation path, download the new JAR from Git, stop any running agent process, replace the old JAR, and restart if running under systemd.
-
