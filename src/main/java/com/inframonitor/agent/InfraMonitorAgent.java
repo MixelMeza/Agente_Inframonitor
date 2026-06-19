@@ -9,9 +9,12 @@ import java.net.URL;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,22 +34,26 @@ import java.security.cert.X509Certificate;
  * on behalf of the backend — no inbound ports required on the agent host.
  *
  * Usage:
- *   java -jar inframonitor-agent.jar --server=ws://your-backend:9875/ws/agents \
+ *   java -jar inframonitor-agent.jar --allow-console --server=ws://your-backend:9875/ws/agents \
  *                                    --name=office-network-agent \
  *                                    --key=ima_xxxxxxxxxxxx
  *
  * Optional:
  *   --heartbeat=30          (seconds between heartbeats, default 30)
  *   --reconnect-delay=5     (seconds between reconnect attempts, default 5)
+ *   --allow-console         enable remote terminal commands from InfraMonitor ADMIN users
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.2";
+    private static final String VERSION = "1.0.3";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
     private static volatile boolean debugEnabled =
             Boolean.parseBoolean(System.getenv().getOrDefault("INFRAMONITOR_AGENT_DEBUG", "false"));
+    private static volatile boolean consoleEnabled =
+            Boolean.parseBoolean(System.getenv().getOrDefault("INFRAMONITOR_AGENT_CONSOLE", "false"));
+    private static final Map<String, ShellSession> shellSessions = new ConcurrentHashMap<>();
 
     /**
      * C: Adaptive timeout — tracks the exponential moving average (EMA) of latency
@@ -119,6 +126,8 @@ public class InfraMonitorAgent {
         for (String arg : args) {
             if (arg.equals("--debug")) {
                 debugEnabled = true;
+            } else if (arg.equals("--allow-console")) {
+                consoleEnabled = true;
             }
         }
 
@@ -142,7 +151,7 @@ public class InfraMonitorAgent {
 
         if (serverUrl == null || agentName == null || apiKey == null) {
             System.err.println("Usage: java -jar inframonitor-agent.jar " +
-                    "--server=ws://host:9875/ws/agents --name=AGENT_NAME --key=API_KEY [--debug]");
+                    "--server=ws://host:9875/ws/agents --name=AGENT_NAME --key=API_KEY [--debug] [--allow-console]");
             System.exit(1);
         }
 
@@ -150,6 +159,7 @@ public class InfraMonitorAgent {
         log("InfraMonitor Agent v" + VERSION + " starting...");
         log("Agent name : " + agentName);
         log("Backend    : " + serverUrl);
+        log("Console   : " + (consoleEnabled ? "enabled" : "disabled"));
 
         int finalReconnectDelaySec = reconnectDelaySec;
         int finalHeartbeatSec = heartbeatSec;
@@ -250,9 +260,65 @@ public class InfraMonitorAgent {
             case "CHECK":
                 handleCheck(ws, json);
                 break;
+            case "SHELL_START":
+                handleShellStart(ws, json, agentName);
+                break;
+            case "SHELL_INPUT":
+                handleShellInput(ws, json);
+                break;
+            case "SHELL_STOP":
+                handleShellStop(ws, json);
+                break;
             default:
                 log("Unknown message type: " + type);
                 break;
+        }
+    }
+
+    private static void handleShellStart(WebSocket ws, String json, String agentName) {
+        String sessionId = extractString(json, "sessionId");
+        String shell = extractString(json, "shell");
+        if (sessionId == null || sessionId.isBlank()) return;
+        if (!consoleEnabled) {
+            sendShellError(ws, sessionId, "Remote console is disabled. Start the agent with --allow-console.");
+            return;
+        }
+        try {
+            ShellSession previous = shellSessions.remove(sessionId);
+            if (previous != null) previous.stop();
+
+            ShellSession session = new ShellSession(sessionId, shell, ws);
+            shellSessions.put(sessionId, session);
+            session.start();
+            sendJson(ws, "{\"type\":\"SHELL_READY\",\"sessionId\":\"" + jsonEscape(sessionId) +
+                    "\",\"agentName\":\"" + jsonEscape(agentName) +
+                    "\",\"shell\":\"" + jsonEscape(session.shellName()) + "\"}");
+            log("Remote console opened session=" + sessionId + " shell=" + session.shellName());
+        } catch (Exception e) {
+            sendShellError(ws, sessionId, "Could not start shell: " + e.getMessage());
+        }
+    }
+
+    private static void handleShellInput(WebSocket ws, String json) {
+        String sessionId = extractString(json, "sessionId");
+        String input = extractString(json, "input");
+        ShellSession session = sessionId != null ? shellSessions.get(sessionId) : null;
+        if (session == null) {
+            if (sessionId != null) sendShellError(ws, sessionId, "Shell session not found");
+            return;
+        }
+        try {
+            session.write(input != null ? input : "");
+        } catch (Exception e) {
+            sendShellError(ws, sessionId, "Shell input failed: " + e.getMessage());
+        }
+    }
+
+    private static void handleShellStop(WebSocket ws, String json) {
+        String sessionId = extractString(json, "sessionId");
+        ShellSession session = sessionId != null ? shellSessions.remove(sessionId) : null;
+        if (session != null) {
+            session.stop();
         }
     }
 
@@ -690,10 +756,66 @@ public class InfraMonitorAgent {
         }
     }
 
+    private static void sendJson(WebSocket ws, String json) {
+        synchronized (ws) {
+            ws.sendText(json, true);
+        }
+    }
+
+    private static void sendShellOutput(WebSocket ws, String sessionId, String stream, String data) {
+        if (data == null || data.isEmpty()) return;
+        sendJson(ws, "{\"type\":\"SHELL_OUTPUT\",\"sessionId\":\"" + jsonEscape(sessionId) +
+                "\",\"stream\":\"" + jsonEscape(stream) +
+                "\",\"data\":\"" + jsonEscape(data) + "\"}");
+    }
+
+    private static void sendShellError(WebSocket ws, String sessionId, String message) {
+        sendJson(ws, "{\"type\":\"SHELL_ERROR\",\"sessionId\":\"" + jsonEscape(sessionId) +
+                "\",\"message\":\"" + jsonEscape(message) + "\"}");
+    }
+
+    private static void sendShellExit(WebSocket ws, String sessionId, int exitCode) {
+        sendJson(ws, "{\"type\":\"SHELL_EXIT\",\"sessionId\":\"" + jsonEscape(sessionId) +
+                "\",\"exitCode\":" + exitCode + "}");
+    }
+
     private static String compact(String text) {
         if (text == null) return "";
         String oneLine = text.replace('\r', ' ').replace('\n', ' ').replaceAll("\\s+", " ").trim();
         return oneLine.length() > 500 ? oneLine.substring(0, 500) + "..." : oneLine;
+    }
+
+    private static String jsonEscape(String text) {
+        if (text == null) return "";
+        StringBuilder sb = new StringBuilder(text.length() + 16);
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            switch (c) {
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 32) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                    break;
+            }
+        }
+        return sb.toString();
     }
 
     private static final class CheckResult {
@@ -705,6 +827,90 @@ public class InfraMonitorAgent {
             this.status = status;
             this.latencyMs = latencyMs;
             this.message = message;
+        }
+    }
+
+    private static final class ShellSession {
+        private final String sessionId;
+        private final String requestedShell;
+        private final WebSocket ws;
+        private Process process;
+
+        ShellSession(String sessionId, String requestedShell, WebSocket ws) {
+            this.sessionId = sessionId;
+            this.requestedShell = requestedShell;
+            this.ws = ws;
+        }
+
+        String shellName() {
+            if (requestedShell != null && !requestedShell.isBlank()) return requestedShell;
+            return isWindows() ? "cmd.exe" : "/bin/sh";
+        }
+
+        void start() throws Exception {
+            ProcessBuilder pb = new ProcessBuilder(shellName());
+            pb.redirectErrorStream(false);
+            process = pb.start();
+
+            Thread stdout = new Thread(() -> readLoop(process.getInputStream(), "stdout"),
+                    "inframonitor-shell-stdout-" + sessionId);
+            Thread stderr = new Thread(() -> readLoop(process.getErrorStream(), "stderr"),
+                    "inframonitor-shell-stderr-" + sessionId);
+            Thread waiter = new Thread(() -> {
+                try {
+                    int code = process.waitFor();
+                    shellSessions.remove(sessionId);
+                    sendShellExit(ws, sessionId, code);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "inframonitor-shell-wait-" + sessionId);
+            stdout.setDaemon(true);
+            stderr.setDaemon(true);
+            waiter.setDaemon(true);
+            stdout.start();
+            stderr.start();
+            waiter.start();
+        }
+
+        void write(String input) throws Exception {
+            if (process == null || !process.isAlive()) {
+                throw new IllegalStateException("Shell process is not running");
+            }
+            byte[] bytes = input.getBytes(Charset.defaultCharset());
+            process.getOutputStream().write(bytes);
+            process.getOutputStream().flush();
+        }
+
+        void stop() {
+            if (process == null) return;
+            try {
+                process.destroy();
+                if (!process.waitFor(1500, TimeUnit.MILLISECONDS)) {
+                    process.destroyForcibly();
+                }
+            } catch (Exception ignored) {
+                process.destroyForcibly();
+            }
+        }
+
+        private void readLoop(java.io.InputStream input, String stream) {
+            byte[] buffer = new byte[4096];
+            try {
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    String text = new String(buffer, 0, read, Charset.defaultCharset());
+                    sendShellOutput(ws, sessionId, stream, text);
+                }
+            } catch (Exception e) {
+                if (process != null && process.isAlive()) {
+                    sendShellOutput(ws, sessionId, "stderr", "Read error: " + e.getMessage() + "\n");
+                }
+            }
+        }
+
+        private static boolean isWindows() {
+            return System.getProperty("os.name").toLowerCase().contains("win");
         }
     }
 }
