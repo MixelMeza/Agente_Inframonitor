@@ -520,7 +520,8 @@ public class InfraMonitorAgent {
 
     private static int tryHttpAgentConnect(String rawUrl, String method, boolean trustAll, int timeoutMs) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(rawUrl).openConnection();
-        if (trustAll && conn instanceof javax.net.ssl.HttpsURLConnection httpsConn) {
+        if (trustAll && conn instanceof javax.net.ssl.HttpsURLConnection) {
+            javax.net.ssl.HttpsURLConnection httpsConn = (javax.net.ssl.HttpsURLConnection) conn;
             httpsConn.setSSLSocketFactory(trustAllSocketFactory);
             httpsConn.setHostnameVerifier(trustAllHostnameVerifier);
         }
