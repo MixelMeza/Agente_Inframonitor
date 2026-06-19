@@ -242,10 +242,17 @@ public class InfraMonitorAgent {
         if (type == null) return;
 
         switch (type) {
-            case "WELCOME" -> log("Registered with backend (agentId=" + extractString(json, "agentId") + ")");
-            case "PONG"    -> {} // ignore
-            case "CHECK"   -> handleCheck(ws, json);
-            default        -> log("Unknown message type: " + type);
+            case "WELCOME":
+                log("Registered with backend (agentId=" + extractString(json, "agentId") + ")");
+                break;
+            case "PONG":
+                break;
+            case "CHECK":
+                handleCheck(ws, json);
+                break;
+            default:
+                log("Unknown message type: " + type);
+                break;
         }
     }
 
@@ -304,47 +311,49 @@ public class InfraMonitorAgent {
                                             String url, int timeoutMs) {
         long start = System.currentTimeMillis();
         try {
-            return switch (monitorType != null ? monitorType.toUpperCase() : "") {
-                case "PING" -> {
+            String normalizedType = monitorType != null ? monitorType.toUpperCase() : "";
+            switch (normalizedType) {
+                case "PING": {
                     long rtt = pingHost(target, timeoutMs);
                     boolean ok = rtt >= 0;
-                    yield new CheckResult(ok ? "UP" : "DOWN", ok ? rtt : 0,
+                    return new CheckResult(ok ? "UP" : "DOWN", ok ? rtt : 0,
                             ok ? "PING OK (" + rtt + "ms)" : "Host unreachable / timeout");
                 }
-                case "TCP" -> {
+                case "TCP": {
                     int p = port != null ? port : 80;
                     try (Socket s = new Socket()) {
                         s.connect(new InetSocketAddress(target, p), timeoutMs);
                         long latency = System.currentTimeMillis() - start;
-                        yield new CheckResult("UP", latency, "TCP " + p + " open (" + latency + "ms)");
+                        return new CheckResult("UP", latency, "TCP " + p + " open (" + latency + "ms)");
                     }
                 }
-                case "HTTP" -> {
+                case "HTTP": {
                     String rawUrl = (url != null && !url.equals("null") && !url.isBlank())
                             ? url
                             : "http://" + target + (port != null ? ":" + port : "");
                     if (!rawUrl.startsWith("http")) rawUrl = "http://" + rawUrl;
-                    yield executeHttpAgentCheck(rawUrl, timeoutMs);
+                    return executeHttpAgentCheck(rawUrl, timeoutMs);
                 }
-                case "DNS" -> {
+                case "DNS": {
                     InetAddress addr = InetAddress.getByName(target);
                     long latency = System.currentTimeMillis() - start;
-                    yield new CheckResult("UP", latency, "DNS resolved to " + addr.getHostAddress());
+                    return new CheckResult("UP", latency, "DNS resolved to " + addr.getHostAddress());
                 }
-                case "IMAP" -> {
+                case "IMAP": {
                     int p = port != null ? port : 143;
-                    yield checkImapAgent(target, p, timeoutMs);
+                    return checkImapAgent(target, p, timeoutMs);
                 }
-                case "LDAP" -> {
+                case "LDAP": {
                     int p = port != null ? port : 389;
-                    yield checkLdapAgent(target, p, timeoutMs);
+                    return checkLdapAgent(target, p, timeoutMs);
                 }
-                case "SIP" -> {
+                case "SIP": {
                     int p = port != null ? port : 5060;
-                    yield checkSipAgent(target, p, timeoutMs);
+                    return checkSipAgent(target, p, timeoutMs);
                 }
-                default -> new CheckResult("UNKNOWN", 0, "Unsupported monitor type: " + monitorType);
-            };
+                default:
+                    return new CheckResult("UNKNOWN", 0, "Unsupported monitor type: " + monitorType);
+            }
         } catch (java.net.SocketTimeoutException e) {
             long latency = System.currentTimeMillis() - start;
             return new CheckResult("DOWN", latency, "Timeout after " + latency + "ms");
@@ -686,5 +695,15 @@ public class InfraMonitorAgent {
         return oneLine.length() > 500 ? oneLine.substring(0, 500) + "..." : oneLine;
     }
 
-    record CheckResult(String status, long latencyMs, String message) {}
+    private static final class CheckResult {
+        final String status;
+        final long latencyMs;
+        final String message;
+
+        CheckResult(String status, long latencyMs, String message) {
+            this.status = status;
+            this.latencyMs = latencyMs;
+            this.message = message;
+        }
+    }
 }
