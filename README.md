@@ -104,11 +104,23 @@ systemctl start inframonitor-agent
 Run this on the same machine where the agent is installed:
 
 ```bash
-java -jar inframonitor-agent.jar --test-ping=8.8.8.8
+java -jar inframonitor-agent.jar --debug --test-ping=8.8.8.8
 ```
 
 The value printed by the agent must match the local console ping RTT. If the console
 shows ~33 ms, the agent should also report ~33 ms, not the timeout value.
+
+For live monitoring diagnostics, start the agent with `--debug`:
+
+```bash
+java -jar inframonitor-agent.jar --debug \
+  --server=ws://your-backend:9875/ws/agents \
+  --name=office-network \
+  --key=ima_xxxx
+```
+
+Debug mode prints the received check timeout, the exact `ping` command, process elapsed
+time, exit code, compact ping output, and parsed RTT.
 
 ## DNS Resolution
 

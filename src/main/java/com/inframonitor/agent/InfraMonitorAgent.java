@@ -41,10 +41,12 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.1";
+    private static final String VERSION = "1.0.2";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
+    private static volatile boolean debugEnabled =
+            Boolean.parseBoolean(System.getenv().getOrDefault("INFRAMONITOR_AGENT_DEBUG", "false"));
 
     /**
      * C: Adaptive timeout — tracks the exponential moving average (EMA) of latency
@@ -115,6 +117,12 @@ public class InfraMonitorAgent {
         int reconnectDelaySec = 5;
 
         for (String arg : args) {
+            if (arg.equals("--debug")) {
+                debugEnabled = true;
+            }
+        }
+
+        for (String arg : args) {
             if (arg.startsWith("--server="))          serverUrl = arg.substring(9);
             else if (arg.startsWith("--name="))       agentName = arg.substring(7);
             else if (arg.startsWith("--key="))        apiKey = arg.substring(6);
@@ -134,7 +142,7 @@ public class InfraMonitorAgent {
 
         if (serverUrl == null || agentName == null || apiKey == null) {
             System.err.println("Usage: java -jar inframonitor-agent.jar " +
-                    "--server=ws://host:9875/ws/agents --name=AGENT_NAME --key=API_KEY");
+                    "--server=ws://host:9875/ws/agents --name=AGENT_NAME --key=API_KEY [--debug]");
             System.exit(1);
         }
 
@@ -254,6 +262,13 @@ public class InfraMonitorAgent {
         requestedTimeout = Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, requestedTimeout));
         // C: Use adaptive timeout based on historical latency for this target
         int timeoutMs = adaptiveTimeout(target != null ? target : "", requestedTimeout);
+        debug("CHECK id=" + checkId
+                + " type=" + monitorType
+                + " target=" + target
+                + " port=" + port
+                + " requestedTimeoutMs=" + requestedTimeout
+                + " effectiveTimeoutMs=" + timeoutMs
+                + " os=" + System.getProperty("os.name"));
 
         log("Executing " + monitorType + " check → " + target + (port != null ? ":" + port : "")
                 + (timeoutMs != requestedTimeout ? " (adaptive timeout: " + timeoutMs + "ms)" : ""));
@@ -368,11 +383,11 @@ public class InfraMonitorAgent {
     private static long pingHost(String target, int timeoutMs) {
         try {
             boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
-            ProcessBuilder pb;
+            java.util.List<String> command;
 
             if (isWindows) {
                 // Windows: -n (count), -w (timeout ms), -4 (IPv4 only, speeds up resolution)
-                pb = new ProcessBuilder("ping", "-n", "1", "-w", String.valueOf(timeoutMs), "-4", target);
+                command = java.util.List.of("ping", "-n", "1", "-w", String.valueOf(timeoutMs), "-4", target);
             } else {
                 // Linux/Mac: Prevent slow PTR (reverse DNS) lookups
                 // - -c: count
@@ -382,17 +397,23 @@ public class InfraMonitorAgent {
                 // Some systems may not support all flags, but they're additive/safe to ignore.
 
                 int timeoutSec = Math.max(1, (timeoutMs + 500) / 1000);  // Round up
-                pb = new ProcessBuilder("ping", "-c", "1", "-n", "-W", String.valueOf(timeoutSec), "-4", target);
+                command = java.util.List.of("ping", "-c", "1", "-n", "-W", String.valueOf(timeoutSec), "-4", target);
             }
 
+            debug("PING command: " + String.join(" ", command));
+            long processStartNs = System.nanoTime();
+            ProcessBuilder pb = new ProcessBuilder(command);
             pb.redirectErrorStream(true);
             Process process = pb.start();
 
             // Java's waitFor() is the actual timeout guarantee (not the OS ping flags).
             boolean finished = process.waitFor(timeoutMs + 1000, TimeUnit.MILLISECONDS);
+            long processElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - processStartNs);
             if (!finished) {
                 process.destroyForcibly();
                 process.waitFor(500, TimeUnit.MILLISECONDS);
+                debug("PING timed out after processElapsedMs=" + processElapsedMs
+                        + " javaTimeoutMs=" + (timeoutMs + 1000));
                 return -1;  // Timeout exceeded
             }
 
@@ -401,22 +422,31 @@ public class InfraMonitorAgent {
             // Require both exit code 0 AND a TTL in the response — on Windows, "ping"
             // can return 0 even for "Destination host unreachable" replies.
             boolean hasTtl = output.toLowerCase().contains("ttl=");
+            debug("PING finished processElapsedMs=" + processElapsedMs
+                    + " exitCode=" + exitCode
+                    + " hasTtl=" + hasTtl
+                    + " output=\"" + compact(output) + "\"");
             if (exitCode != 0 || !hasTtl) {
                 return -1;
             }
 
             java.util.regex.Matcher m = PING_RTT_PATTERN.matcher(output);
             if (m.find()) {
-                return (long) Double.parseDouble(m.group(1));
+                long parsed = (long) Double.parseDouble(m.group(1));
+                debug("PING parsedRttMs=" + parsed);
+                return parsed;
             }
             // TTL present but couldn't parse RTT (unexpected format) — treat as 0ms rather
             // than fabricating a number from wall-clock time.
+            debug("PING had TTL but RTT could not be parsed; returning 0ms");
             return 0;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            debug("PING interrupted: " + e.getMessage());
             return -1;
         } catch (Exception e) {
             // DNS resolution failed, network error, etc.
+            debug("PING failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return -1;
         }
     }
@@ -642,6 +672,18 @@ public class InfraMonitorAgent {
 
     private static void log(String msg) {
         System.out.println("[InfraMonitor-Agent] " + msg);
+    }
+
+    private static void debug(String msg) {
+        if (debugEnabled) {
+            System.out.println("[InfraMonitor-Agent][debug] " + msg);
+        }
+    }
+
+    private static String compact(String text) {
+        if (text == null) return "";
+        String oneLine = text.replace('\r', ' ').replace('\n', ' ').replaceAll("\\s+", " ").trim();
+        return oneLine.length() > 500 ? oneLine.substring(0, 500) + "..." : oneLine;
     }
 
     record CheckResult(String status, long latencyMs, String message) {}
