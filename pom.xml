@@ -6,15 +6,15 @@
 
     <groupId>com.inframonitor</groupId>
     <artifactId>inframonitor-agent</artifactId>
-    <version>1.0.2</version>
+    <version>1.0.4</version>
     <packaging>jar</packaging>
     <name>InfraMonitor Remote Agent</name>
     <description>Lightweight agent that connects to InfraMonitor backend and runs checks on remote networks</description>
 
     <properties>
-        <java.version>17</java.version>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
+        <java.version>11</java.version>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 

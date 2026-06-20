@@ -10,7 +10,15 @@ import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
@@ -21,6 +29,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.*;
 import java.security.SecureRandom;
@@ -45,7 +54,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.3";
+    private static final String VERSION = "1.0.4";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -54,6 +63,11 @@ public class InfraMonitorAgent {
     private static volatile boolean consoleEnabled =
             Boolean.parseBoolean(System.getenv().getOrDefault("INFRAMONITOR_AGENT_CONSOLE", "false"));
     private static final Map<String, ShellSession> shellSessions = new ConcurrentHashMap<>();
+    private static final Map<Long, OfflineService> offlineServices = new ConcurrentHashMap<>();
+    private static final AtomicBoolean backendConnected = new AtomicBoolean(false);
+    private static final Path offlineConfigPath = Path.of("inframonitor-agent-services.cache");
+    private static final Path offlineQueuePath = Path.of("inframonitor-agent-results.queue");
+    private static ScheduledExecutorService offlineScheduler;
 
     /**
      * C: Adaptive timeout — tracks the exponential moving average (EMA) of latency
@@ -160,6 +174,8 @@ public class InfraMonitorAgent {
         log("Agent name : " + agentName);
         log("Backend    : " + serverUrl);
         log("Console   : " + (consoleEnabled ? "enabled" : "disabled"));
+        loadOfflineConfig();
+        startOfflineMonitor();
 
         int finalReconnectDelaySec = reconnectDelaySec;
         int finalHeartbeatSec = heartbeatSec;
@@ -194,8 +210,10 @@ public class InfraMonitorAgent {
                     @Override
                     public void onOpen(WebSocket webSocket) {
                         log("Connected to backend");
+                        backendConnected.set(true);
                         wsRef.set(webSocket);
                         webSocket.request(1);
+                        flushOfflineResults(webSocket);
 
                         // Start heartbeat scheduler
                         heartbeatScheduler.scheduleAtFixedRate(() -> {
@@ -227,6 +245,7 @@ public class InfraMonitorAgent {
                     @Override
                     public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
                         log("Connection closed: " + statusCode + " " + reason);
+                        backendConnected.set(false);
                         heartbeatScheduler.shutdownNow();
                         latch.countDown();
                         return null;
@@ -235,12 +254,14 @@ public class InfraMonitorAgent {
                     @Override
                     public void onError(WebSocket webSocket, Throwable error) {
                         log("WS error: " + error.getMessage());
+                        backendConnected.set(false);
                         heartbeatScheduler.shutdownNow();
                         latch.countDown();
                     }
                 }).join();
 
         latch.await();
+        backendConnected.set(false);
         if (ws.isInputClosed()) ws.abort();
         heartbeatScheduler.shutdownNow();
     }
@@ -259,6 +280,12 @@ public class InfraMonitorAgent {
                 break;
             case "CHECK":
                 handleCheck(ws, json);
+                break;
+            case "CONFIG":
+                handleConfig(json);
+                break;
+            case "OFFLINE_ACK":
+                clearOfflineQueue();
                 break;
             case "SHELL_START":
                 handleShellStart(ws, json, agentName);
@@ -319,6 +346,31 @@ public class InfraMonitorAgent {
         ShellSession session = sessionId != null ? shellSessions.remove(sessionId) : null;
         if (session != null) {
             session.stop();
+        }
+    }
+
+    private static void handleConfig(String json) {
+        String encoded = extractString(json, "data");
+        if (encoded == null || encoded.isBlank()) return;
+        try {
+            String data = new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
+            offlineServices.clear();
+            for (String line : data.split("\\R")) {
+                if (line.isBlank()) continue;
+                OfflineService svc = OfflineService.parse(line);
+                if (svc != null) {
+                    offlineServices.put(svc.id, svc);
+                }
+            }
+            Files.writeString(
+                    offlineConfigPath,
+                    data,
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING);
+            log("Received offline config: " + offlineServices.size() + " service(s)");
+        } catch (Exception e) {
+            log("Could not apply offline config: " + e.getMessage());
         }
     }
 
@@ -725,6 +777,89 @@ public class InfraMonitorAgent {
 
     // ── Minimal JSON extractor (no external libs) ─────────────────────────────
 
+    private static void loadOfflineConfig() {
+        try {
+            if (!Files.exists(offlineConfigPath)) return;
+            List<String> lines = Files.readAllLines(offlineConfigPath, StandardCharsets.UTF_8);
+            for (String line : lines) {
+                OfflineService svc = OfflineService.parse(line);
+                if (svc != null) offlineServices.put(svc.id, svc);
+            }
+            log("Loaded offline config: " + offlineServices.size() + " service(s)");
+        } catch (Exception e) {
+            log("Could not load offline config: " + e.getMessage());
+        }
+    }
+
+    private static void startOfflineMonitor() {
+        offlineScheduler = Executors.newSingleThreadScheduledExecutor();
+        offlineScheduler.scheduleAtFixedRate(() -> {
+            try {
+                if (backendConnected.get() || offlineServices.isEmpty()) return;
+                long now = System.currentTimeMillis();
+                for (OfflineService svc : offlineServices.values()) {
+                    if (now - svc.lastRunAt < svc.intervalSeconds * 1000L) continue;
+                    svc.lastRunAt = now;
+                    checkExecutor.submit(() -> runOfflineCheck(svc));
+                }
+            } catch (Exception e) {
+                debug("offline scheduler error: " + e.getMessage());
+            }
+        }, 2, 1, TimeUnit.SECONDS);
+    }
+
+    private static void runOfflineCheck(OfflineService svc) {
+        if (backendConnected.get()) return;
+        CheckResult result = executeCheck(svc.monitorType, svc.target, svc.port, svc.url, DEFAULT_TIMEOUT_MS);
+        if ("UP".equals(result.status) && result.latencyMs > 0) {
+            recordLatency(svc.target != null ? svc.target : "", result.latencyMs);
+        }
+        appendOfflineResult(svc.id, System.currentTimeMillis(), result);
+        log("Offline result: " + svc.name + " " + result.status + " (" + result.latencyMs + "ms) " + result.message);
+    }
+
+    private static synchronized void appendOfflineResult(long serviceId, long checkedAtMs, CheckResult result) {
+        try {
+            String line = serviceId + "|" + checkedAtMs + "|" + result.status + "|" + result.latencyMs + "|" +
+                    b64(result.message != null ? result.message : "") + "\n";
+            Files.writeString(offlineQueuePath, line, StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception e) {
+            debug("could not append offline result: " + e.getMessage());
+        }
+    }
+
+    private static synchronized void flushOfflineResults(WebSocket ws) {
+        try {
+            if (!Files.exists(offlineQueuePath)) return;
+            String data = Files.readString(offlineQueuePath, StandardCharsets.UTF_8);
+            if (data.isBlank()) return;
+            String encoded = Base64.getEncoder().encodeToString(data.getBytes(StandardCharsets.UTF_8));
+            sendJson(ws, "{\"type\":\"OFFLINE_RESULTS\",\"data\":\"" + encoded + "\"}");
+            log("Sent offline results for sync (" + data.lines().count() + " record(s))");
+        } catch (Exception e) {
+            log("Could not flush offline results: " + e.getMessage());
+        }
+    }
+
+    private static synchronized void clearOfflineQueue() {
+        try {
+            Files.deleteIfExists(offlineQueuePath);
+            log("Offline result queue acknowledged by backend");
+        } catch (Exception e) {
+            debug("could not clear offline queue: " + e.getMessage());
+        }
+    }
+
+    private static String b64(String text) {
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String unb64(String text) {
+        if (text == null || text.isEmpty()) return "";
+        return new String(Base64.getUrlDecoder().decode(text), StandardCharsets.UTF_8);
+    }
+
     private static String extractString(String json, String key) {
         String search = "\"" + key + "\"";
         int idx = json.indexOf(search);
@@ -827,6 +962,46 @@ public class InfraMonitorAgent {
             this.status = status;
             this.latencyMs = latencyMs;
             this.message = message;
+        }
+    }
+
+    private static final class OfflineService {
+        final long id;
+        final String name;
+        final String monitorType;
+        final String target;
+        final Integer port;
+        final String url;
+        final int intervalSeconds;
+        volatile long lastRunAt;
+
+        OfflineService(long id, String name, String monitorType, String target,
+                       Integer port, String url, int intervalSeconds) {
+            this.id = id;
+            this.name = name;
+            this.monitorType = monitorType;
+            this.target = target;
+            this.port = port;
+            this.url = url;
+            this.intervalSeconds = Math.max(1, intervalSeconds);
+        }
+
+        static OfflineService parse(String line) {
+            try {
+                String[] p = line.split("\\|", -1);
+                if (p.length < 7) return null;
+                Integer port = p[4].isBlank() ? null : Integer.parseInt(p[4]);
+                return new OfflineService(
+                        Long.parseLong(p[0]),
+                        unb64(p[1]),
+                        p[2],
+                        unb64(p[3]),
+                        port,
+                        unb64(p[5]),
+                        Integer.parseInt(p[6]));
+            } catch (Exception e) {
+                return null;
+            }
         }
     }
 
