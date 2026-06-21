@@ -430,9 +430,9 @@ public class InfraMonitorAgent {
     // ── Network scan (LAN discovery) ────────────────────────────────────────────
 
     private static final int SCAN_HOST_TIMEOUT_MS = 250;
-    private static final int SCAN_NETWORK_BUDGET_MS = 4500;
-    private static final int SCAN_SUBNET_DISCOVERY_BUDGET_MS = 2500;
-    private static final int SCAN_MAX_NETWORKS_PER_RUN = 8;
+    private static final int SCAN_NETWORK_BUDGET_MS = 1800;
+    private static final int SCAN_SUBNET_DISCOVERY_BUDGET_MS = 7000;
+    private static final int SCAN_MAX_NETWORKS_PER_RUN = 64;
     // Bounds the active sweep so a misconfigured huge subnet (e.g. /8) only scans the local /24 window.
     private static final int SCAN_MAX_PREFIX_LENGTH = 24;
     private static final ExecutorService scanExecutor = new ThreadPoolExecutor(
@@ -447,8 +447,11 @@ public class InfraMonitorAgent {
         long start = System.currentTimeMillis();
         StringBuilder networksJson = new StringBuilder();
         String error = null;
+        int scannedNetworks = 0;
+        int totalNetworks = 0;
         try {
             List<ScanNetwork> networks = localScanNetworks();
+            totalNetworks = Math.min(networks.size(), SCAN_MAX_NETWORKS_PER_RUN);
             if (networks.isEmpty()) {
                 error = "No IPv4 LAN interfaces found on the agent host";
             }
@@ -459,8 +462,12 @@ public class InfraMonitorAgent {
                     log("Network scan budget exhausted; returning partial result");
                     break;
                 }
-                if (i > 0) networksJson.append(',');
-                networksJson.append(scanOneNetwork(networks.get(i), (int) Math.min(remainingMs, SCAN_NETWORK_BUDGET_MS)));
+                String networkJson = scanOneNetwork(networks.get(i), (int) Math.min(remainingMs, SCAN_NETWORK_BUDGET_MS));
+                if (networksJson.length() > 0) networksJson.append(',');
+                networksJson.append(networkJson);
+                scannedNetworks++;
+                sendNetworkScanResult(ws, scanId, true, System.currentTimeMillis() - start, null,
+                        networkJson, scannedNetworks, totalNetworks);
             }
         } catch (Exception e) {
             error = e.getClass().getSimpleName() + ": " + e.getMessage();
@@ -469,8 +476,18 @@ public class InfraMonitorAgent {
         long elapsed = System.currentTimeMillis() - start;
         log("Network scan id=" + scanId + " finished in " + elapsed + "ms");
 
+        sendNetworkScanResult(ws, scanId, false, elapsed, error, networksJson.toString(),
+                scannedNetworks, totalNetworks);
+    }
+
+    private static void sendNetworkScanResult(WebSocket ws, String scanId, boolean partial, long durationMs,
+                                              String error, String networksJson,
+                                              int scannedNetworks, int totalNetworks) {
         sendJson(ws, "{\"type\":\"NETWORK_SCAN_RESULT\",\"id\":\"" + jsonEscape(scanId) +
-                "\",\"durationMs\":" + elapsed +
+                "\",\"partial\":" + partial +
+                ",\"durationMs\":" + durationMs +
+                ",\"scannedNetworks\":" + scannedNetworks +
+                ",\"totalNetworks\":" + totalNetworks +
                 (error != null ? ",\"error\":\"" + jsonEscape(error) + "\"" : "") +
                 ",\"networks\":[" + networksJson + "]}");
     }
@@ -705,7 +722,7 @@ public class InfraMonitorAgent {
 
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .get(Math.max(3000, timeoutMs), TimeUnit.MILLISECONDS);
+                    .get(Math.max(1200, timeoutMs), TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             debug("Network scan ping sweep timed out/partial on " + net.cidr() + ": " + e.getMessage());
         }
