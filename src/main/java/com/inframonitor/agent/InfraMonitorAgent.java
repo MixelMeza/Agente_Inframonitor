@@ -285,6 +285,9 @@ public class InfraMonitorAgent {
             case "NETWORK_SCAN":
                 handleNetworkScan(ws, json);
                 break;
+            case "PORT_SCAN":
+                handlePortScan(ws, json);
+                break;
             case "CONFIG":
                 handleConfig(json);
                 break;
@@ -430,9 +433,10 @@ public class InfraMonitorAgent {
     // ── Network scan (LAN discovery) ────────────────────────────────────────────
 
     private static final int SCAN_HOST_TIMEOUT_MS = 250;
-    private static final int SCAN_NETWORK_BUDGET_MS = 1800;
-    private static final int SCAN_SUBNET_DISCOVERY_BUDGET_MS = 7000;
+    private static final int SCAN_NETWORK_BUDGET_MS = 1400;
+    private static final int SCAN_SUBNET_DISCOVERY_BUDGET_MS = 5000;
     private static final int SCAN_MAX_NETWORKS_PER_RUN = 64;
+    private static final int SCAN_OVERALL_HARD_LIMIT_MS = 59000;
     // Bounds the active sweep so a misconfigured huge subnet (e.g. /8) only scans the local /24 window.
     private static final int SCAN_MAX_PREFIX_LENGTH = 24;
     private static final ExecutorService scanExecutor = new ThreadPoolExecutor(
@@ -441,7 +445,8 @@ public class InfraMonitorAgent {
     private static void handleNetworkScan(WebSocket ws, String json) {
         String scanId = extractString(json, "id");
         String toStr = extractString(json, "timeoutMs");
-        int overallTimeoutMs = (toStr != null && !toStr.equals("null")) ? Integer.parseInt(toStr) : 20000;
+        int overallTimeoutMs = (toStr != null && !toStr.equals("null")) ? Integer.parseInt(toStr) : SCAN_OVERALL_HARD_LIMIT_MS;
+        overallTimeoutMs = Math.min(overallTimeoutMs, SCAN_OVERALL_HARD_LIMIT_MS);
 
         log("Starting network scan id=" + scanId);
         long start = System.currentTimeMillis();
@@ -450,7 +455,7 @@ public class InfraMonitorAgent {
         int scannedNetworks = 0;
         int totalNetworks = 0;
         try {
-            List<ScanNetwork> networks = localScanNetworks();
+            List<ScanNetwork> networks = prioritizedScanNetworks(json);
             totalNetworks = Math.min(networks.size(), SCAN_MAX_NETWORKS_PER_RUN);
             if (networks.isEmpty()) {
                 error = "No IPv4 LAN interfaces found on the agent host";
@@ -480,6 +485,16 @@ public class InfraMonitorAgent {
                 scannedNetworks, totalNetworks);
     }
 
+    private static List<ScanNetwork> prioritizedScanNetworks(String json) throws Exception {
+        List<ScanNetwork> result = new ArrayList<>();
+        addManualScanNetworks(result, extractString(json, "data"));
+        for (ScanNetwork network : localScanNetworks()) {
+            addScanNetwork(result, network);
+        }
+        addSiblingRouteCandidates(result);
+        return result;
+    }
+
     private static void sendNetworkScanResult(WebSocket ws, String scanId, boolean partial, long durationMs,
                                               String error, String networksJson,
                                               int scannedNetworks, int totalNetworks) {
@@ -490,6 +505,137 @@ public class InfraMonitorAgent {
                 ",\"totalNetworks\":" + totalNetworks +
                 (error != null ? ",\"error\":\"" + jsonEscape(error) + "\"" : "") +
                 ",\"networks\":[" + networksJson + "]}");
+    }
+
+    private static final int[] PORT_SCAN_COMMON_PORTS = {
+            80, 443, 22, 3389, 8080, 8443, 53, 445, 139, 135, 21, 20, 25, 110, 143,
+            587, 993, 995, 3306, 5432, 1433, 1521, 6379, 27017, 9200, 9300, 5601,
+            3000, 3001, 5000, 5001, 8000, 8008, 8888, 9000, 9090, 9092, 9443,
+            23, 161, 389, 636, 514, 631, 5900, 5901, 5985, 5986, 6443, 2375,
+            2376, 10250, 10255, 2049, 111, 123, 500, 4500, 1194, 1723, 1883,
+            8883, 5060, 5061, 554, 1935, 8081, 8082, 8090, 10000, 49152
+    };
+
+    private static void handlePortScan(WebSocket ws, String json) {
+        String scanId = extractString(json, "id");
+        String target = extractString(json, "target");
+        String toStr = extractString(json, "timeoutMs");
+        int overallTimeoutMs = (toStr != null && !toStr.equals("null")) ? Integer.parseInt(toStr) : 20000;
+        overallTimeoutMs = Math.min(overallTimeoutMs, 25000);
+        if (target == null || target.isBlank()) {
+            sendJson(ws, "{\"type\":\"PORT_SCAN_RESULT\",\"id\":\"" + jsonEscape(scanId) +
+                    "\",\"error\":\"Target IP is required\",\"ports\":[]}");
+            return;
+        }
+
+        long start = System.currentTimeMillis();
+        List<PortScanHit> hits = new ArrayList<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        int timeoutMs = 280;
+        for (int index = 0; index < PORT_SCAN_COMMON_PORTS.length; index++) {
+            int priority = index;
+            int port = PORT_SCAN_COMMON_PORTS[index];
+            futures.add(CompletableFuture.runAsync(() -> {
+                long started = System.currentTimeMillis();
+                if (tcpPortOpen(target, port, timeoutMs)) {
+                    synchronized (hits) {
+                        hits.add(new PortScanHit(port, priority, System.currentTimeMillis() - started));
+                    }
+                }
+            }, scanExecutor));
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(overallTimeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            debug("Port scan returned partial results for " + target + ": " + e.getMessage());
+        }
+
+        hits.sort((a, b) -> Integer.compare(a.priority, b.priority));
+        StringBuilder portsJson = new StringBuilder();
+        for (PortScanHit hit : hits) {
+            if (portsJson.length() > 0) portsJson.append(',');
+            portsJson.append("{\"port\":").append(hit.port)
+                    .append(",\"protocol\":\"tcp\"")
+                    .append(",\"status\":\"open\"")
+                    .append(",\"latencyMs\":").append(hit.latencyMs)
+                    .append(",\"service\":\"").append(jsonEscape(portServiceName(hit.port))).append("\"}");
+        }
+        long elapsed = System.currentTimeMillis() - start;
+        sendJson(ws, "{\"type\":\"PORT_SCAN_RESULT\",\"id\":\"" + jsonEscape(scanId) +
+                "\",\"target\":\"" + jsonEscape(target) +
+                "\",\"durationMs\":" + elapsed +
+                ",\"scannedPorts\":" + PORT_SCAN_COMMON_PORTS.length +
+                ",\"ports\":[" + portsJson + "]}");
+    }
+
+    private static final class PortScanHit {
+        final int port;
+        final int priority;
+        final long latencyMs;
+
+        PortScanHit(int port, int priority, long latencyMs) {
+            this.port = port;
+            this.priority = priority;
+            this.latencyMs = latencyMs;
+        }
+    }
+
+    private static boolean tcpPortOpen(String target, int port, int timeoutMs) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(target, port), timeoutMs);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static String portServiceName(int port) {
+        switch (port) {
+            case 20: return "ftp-data";
+            case 21: return "ftp";
+            case 22: return "ssh";
+            case 23: return "telnet";
+            case 25: return "smtp";
+            case 53: return "dns";
+            case 80: return "http";
+            case 110: return "pop3";
+            case 123: return "ntp";
+            case 135: return "msrpc";
+            case 139: return "netbios";
+            case 143: return "imap";
+            case 161: return "snmp";
+            case 389: return "ldap";
+            case 443: return "https";
+            case 445: return "smb";
+            case 587: return "smtp-submission";
+            case 631: return "ipp";
+            case 636: return "ldaps";
+            case 993: return "imaps";
+            case 995: return "pop3s";
+            case 1433: return "mssql";
+            case 1521: return "oracle";
+            case 1883: return "mqtt";
+            case 2049: return "nfs";
+            case 2375: return "docker";
+            case 2376: return "docker-tls";
+            case 3000: return "web-dev";
+            case 3306: return "mysql";
+            case 3389: return "rdp";
+            case 5432: return "postgres";
+            case 5601: return "kibana";
+            case 5900: return "vnc";
+            case 5985: return "winrm";
+            case 5986: return "winrm-ssl";
+            case 6379: return "redis";
+            case 6443: return "kubernetes-api";
+            case 8080: return "http-alt";
+            case 8443: return "https-alt";
+            case 8883: return "mqtts";
+            case 9200: return "elasticsearch";
+            case 9300: return "elasticsearch-node";
+            default: return "";
+        }
     }
 
     /** A local IPv4 network reachable from one of this host's interfaces. */
@@ -514,6 +660,45 @@ public class InfraMonitorAgent {
      * networks they're attached to. Large networks (prefix < /22) are clamped to the
      * /24 containing this host's address so the sweep stays fast.
      */
+    private static void addManualScanNetworks(List<ScanNetwork> result, String encoded) {
+        if (encoded == null || encoded.isBlank() || "null".equals(encoded)) return;
+        try {
+            String decoded = new String(Base64.getUrlDecoder().decode(encoded), StandardCharsets.UTF_8);
+            for (String token : decoded.split("[,\\s]+")) {
+                ScanNetwork network = parseManualScanNetwork(token.trim());
+                if (network != null) addScanNetwork(result, network);
+            }
+        } catch (Exception e) {
+            log("Could not parse manual scan networks: " + e.getMessage());
+        }
+    }
+
+    private static ScanNetwork parseManualScanNetwork(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            String cidr = raw.contains("/") ? raw : raw + "/32";
+            String[] parts = cidr.split("/", 2);
+            int prefix = Integer.parseInt(parts[1]);
+            if (prefix < SCAN_MAX_PREFIX_LENGTH) prefix = SCAN_MAX_PREFIX_LENGTH;
+            if (prefix > 32) return null;
+            int value = ipToInt(parts[0]);
+            int mask = prefix == 0 ? 0 : (int) (0xFFFFFFFFL << (32 - prefix));
+            String baseIp = intToIp(value & mask);
+            String localIp = prefix == 32 ? parts[0] : intToIp((value & mask) + 1);
+            return new ScanNetwork("manual", baseIp, localIp, prefix);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static void addScanNetwork(List<ScanNetwork> result, ScanNetwork network) {
+        if (network == null) return;
+        for (ScanNetwork existing : result) {
+            if (existing.cidr().equals(network.cidr())) return;
+        }
+        result.add(network);
+    }
+
     private static List<ScanNetwork> localScanNetworks() throws Exception {
         List<ScanNetwork> result = new ArrayList<>();
         java.util.Enumeration<java.net.NetworkInterface> ifaces = java.net.NetworkInterface.getNetworkInterfaces();
@@ -534,7 +719,7 @@ public class InfraMonitorAgent {
                 int ip = ipToInt(addr.getHostAddress());
                 int mask = scanPrefix == 0 ? 0 : (int) (0xFFFFFFFFL << (32 - scanPrefix));
                 int network = ip & mask;
-                result.add(new ScanNetwork(iface.getName(), intToIp(network), addr.getHostAddress(), scanPrefix));
+                addScanNetwork(result, new ScanNetwork(iface.getName(), intToIp(network), addr.getHostAddress(), scanPrefix));
                 debug("Network scan interface " + iface.getName() + " localIp=" + addr.getHostAddress()
                         + " cidr=" + intToIp(network) + "/" + scanPrefix);
             }
@@ -582,7 +767,7 @@ public class InfraMonitorAgent {
             String cidr = entry.getKey();
             if (hasNetwork(result, cidr)) continue;
             String baseIp = cidr.substring(0, cidr.indexOf('/'));
-            result.add(new ScanNetwork("routed", baseIp, entry.getValue(), 24));
+            addScanNetwork(result, new ScanNetwork("routed", baseIp, entry.getValue(), 24));
             added++;
         }
         if (added > 0) {
@@ -687,7 +872,7 @@ public class InfraMonitorAgent {
             for (ScanNetwork existing : result) {
                 if (existing.cidr().equals(key)) return;
             }
-            result.add(new ScanNetwork(dev.isBlank() ? "route" : dev, baseIp, src, scanPrefix));
+            addScanNetwork(result, new ScanNetwork(dev.isBlank() ? "route" : dev, baseIp, src, scanPrefix));
             debug("Network scan direct route localIp=" + src + " cidr=" + key);
         } catch (Exception ignored) {
             // Ignore route lines that don't look like IPv4 CIDR + src.
@@ -697,8 +882,6 @@ public class InfraMonitorAgent {
     private static String scanOneNetwork(ScanNetwork net, int timeoutMs) {
         int network = ipToInt(net.baseIp);
         int hostBits = 32 - net.prefixLength;
-        long totalHosts = hostBits >= 31 ? 1 : (1L << hostBits) - 2; // exclude network+broadcast
-        totalHosts = Math.max(totalHosts, 1);
 
         Map<String, Long> discovered = new java.util.concurrent.ConcurrentHashMap<>();
         discovered.put(net.localIp, 0L);
@@ -709,8 +892,7 @@ public class InfraMonitorAgent {
         }
 
         List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (long h = 1; h <= totalHosts; h++) {
-            int candidate = network + (int) h;
+        for (int candidate : scanCandidates(network, net.prefixLength)) {
             String ip = intToIp(candidate);
             futures.add(CompletableFuture.runAsync(() -> {
                 long rtt = pingHostQuiet(ip, SCAN_HOST_TIMEOUT_MS);
@@ -754,6 +936,25 @@ public class InfraMonitorAgent {
         return "{\"cidr\":\"" + jsonEscape(net.cidr()) +
                 "\",\"interfaceName\":\"" + jsonEscape(net.interfaceName) +
                 "\",\"hosts\":[" + hostsJson + "]}";
+    }
+
+    private static List<Integer> scanCandidates(int network, int prefixLength) {
+        List<Integer> candidates = new ArrayList<>();
+        int hostBits = 32 - prefixLength;
+        if (hostBits <= 0) {
+            candidates.add(network);
+            return candidates;
+        }
+        if (hostBits == 1) {
+            candidates.add(network);
+            candidates.add(network + 1);
+            return candidates;
+        }
+        long totalHosts = (1L << hostBits) - 2;
+        for (long h = 1; h <= totalHosts; h++) {
+            candidates.add(network + (int) h);
+        }
+        return candidates;
     }
 
     private static String hostJson(String ip, long latencyMs) {
