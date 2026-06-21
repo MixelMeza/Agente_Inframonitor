@@ -55,7 +55,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.8";
+    private static final String VERSION = "1.0.9";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -431,6 +431,8 @@ public class InfraMonitorAgent {
 
     private static final int SCAN_HOST_TIMEOUT_MS = 250;
     private static final int SCAN_NETWORK_BUDGET_MS = 4500;
+    private static final int SCAN_SUBNET_DISCOVERY_BUDGET_MS = 2500;
+    private static final int SCAN_MAX_NETWORKS_PER_RUN = 8;
     // Bounds the active sweep so a misconfigured huge subnet (e.g. /8) only scans the local /24 window.
     private static final int SCAN_MAX_PREFIX_LENGTH = 24;
     private static final ExecutorService scanExecutor = new ThreadPoolExecutor(
@@ -450,7 +452,8 @@ public class InfraMonitorAgent {
             if (networks.isEmpty()) {
                 error = "No IPv4 LAN interfaces found on the agent host";
             }
-            for (int i = 0; i < networks.size(); i++) {
+            log("Network scan discovered " + networks.size() + " candidate subnet(s)");
+            for (int i = 0; i < networks.size() && i < SCAN_MAX_NETWORKS_PER_RUN; i++) {
                 long remainingMs = overallTimeoutMs - (System.currentTimeMillis() - start) - 1000;
                 if (remainingMs <= 500) {
                     log("Network scan budget exhausted; returning partial result");
@@ -520,7 +523,107 @@ public class InfraMonitorAgent {
             }
         }
         addDirectRouteNetworks(result);
+        addSiblingRouteCandidates(result);
         return result;
+    }
+
+    private static void addSiblingRouteCandidates(List<ScanNetwork> result) {
+        java.util.LinkedHashSet<String> candidates = new java.util.LinkedHashSet<>();
+        for (ScanNetwork net : new ArrayList<>(result)) {
+            addSiblingCandidateCidrs(candidates, net.localIp, net.cidr());
+        }
+        if (candidates.isEmpty()) return;
+
+        long start = System.currentTimeMillis();
+        java.util.concurrent.ConcurrentHashMap<String, String> alive = new java.util.concurrent.ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> probes = new ArrayList<>();
+
+        for (String cidr : candidates) {
+            if (System.currentTimeMillis() - start > SCAN_SUBNET_DISCOVERY_BUDGET_MS) break;
+            String baseIp = cidr.substring(0, cidr.indexOf('/'));
+            int base = ipToInt(baseIp);
+            for (int host : new int[]{1, 254}) {
+                String gatewayIp = intToIp(base + host);
+                probes.add(CompletableFuture.runAsync(() -> {
+                    if (isLikelyAlive(gatewayIp, 180)) {
+                        alive.putIfAbsent(cidr, gatewayIp);
+                    }
+                }, scanExecutor));
+            }
+        }
+
+        try {
+            CompletableFuture.allOf(probes.toArray(new CompletableFuture[0]))
+                    .get(SCAN_SUBNET_DISCOVERY_BUDGET_MS, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            debug("Sibling subnet discovery returned partial results: " + e.getMessage());
+        }
+
+        int added = 0;
+        for (Map.Entry<String, String> entry : alive.entrySet()) {
+            if (added >= SCAN_MAX_NETWORKS_PER_RUN) break;
+            String cidr = entry.getKey();
+            if (hasNetwork(result, cidr)) continue;
+            String baseIp = cidr.substring(0, cidr.indexOf('/'));
+            result.add(new ScanNetwork("routed", baseIp, entry.getValue(), 24));
+            added++;
+        }
+        if (added > 0) {
+            log("Network scan found " + added + " routed sibling subnet(s)");
+        }
+    }
+
+    private static void addSiblingCandidateCidrs(java.util.LinkedHashSet<String> out, String localIp, String currentCidr) {
+        if (localIp == null || localIp.isBlank()) return;
+        String[] p = localIp.split("\\.");
+        if (p.length != 4) return;
+        try {
+            int a = Integer.parseInt(p[0]);
+            int b = Integer.parseInt(p[1]);
+            int c = Integer.parseInt(p[2]);
+
+            if (a == 192 && b == 168) {
+                for (int third = 0; third <= 255; third++) addCandidate(out, "192.168." + third + ".0/24", currentCidr);
+            } else if (a == 172 && b >= 16 && b <= 31) {
+                for (int third = 0; third <= 255; third++) addCandidate(out, "172." + b + "." + third + ".0/24", currentCidr);
+            } else if (a == 10) {
+                for (int third = 0; third <= 255; third++) addCandidate(out, "10." + b + "." + third + ".0/24", currentCidr);
+            } else {
+                int from = Math.max(0, c - 8);
+                int to = Math.min(255, c + 8);
+                for (int third = from; third <= to; third++) addCandidate(out, a + "." + b + "." + third + ".0/24", currentCidr);
+            }
+        } catch (Exception ignored) {
+            // Ignore malformed local addresses.
+        }
+    }
+
+    private static void addCandidate(java.util.LinkedHashSet<String> out, String cidr, String currentCidr) {
+        if (!cidr.equals(currentCidr)) out.add(cidr);
+    }
+
+    private static boolean hasNetwork(List<ScanNetwork> networks, String cidr) {
+        for (ScanNetwork n : networks) {
+            if (n.cidr().equals(cidr)) return true;
+        }
+        return false;
+    }
+
+    private static boolean isLikelyAlive(String ip, int timeoutMs) {
+        if (pingHostQuiet(ip, timeoutMs) >= 0) return true;
+        return tcpProbe(ip, 80, timeoutMs) || tcpProbe(ip, 443, timeoutMs) || tcpProbe(ip, 22, timeoutMs);
+    }
+
+    private static boolean tcpProbe(String ip, int port, int timeoutMs) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(ip, port), timeoutMs);
+            return true;
+        } catch (java.net.ConnectException e) {
+            String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+            return msg.contains("refused");
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private static void addDirectRouteNetworks(List<ScanNetwork> result) {
