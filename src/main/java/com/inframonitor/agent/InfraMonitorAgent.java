@@ -55,7 +55,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.6";
+    private static final String VERSION = "1.0.7";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -1502,13 +1502,22 @@ public class InfraMonitorAgent {
                 return java.util.List.of("cmd.exe");
             }
             String shell = shellName();
-            return java.util.List.of(shell, "-i");
+            if (shell.endsWith("bash")) {
+                return java.util.List.of(shell, "--noprofile", "--norc");
+            }
+            return java.util.List.of(shell);
         }
 
         void start() throws Exception {
             ProcessBuilder pb = new ProcessBuilder(shellCommand());
             pb.redirectErrorStream(false);
-            pb.environment().putIfAbsent("TERM", "xterm-256color");
+            pb.environment().put("TERM", "dumb");
+            pb.environment().put("NO_COLOR", "1");
+            pb.environment().put("CLICOLOR", "0");
+            if (!isWindows()) {
+                pb.environment().put("PS1", "$ ");
+                pb.environment().put("PROMPT_COMMAND", "");
+            }
             process = pb.start();
 
             Thread stdout = new Thread(() -> readLoop(process.getInputStream(), "stdout"),
