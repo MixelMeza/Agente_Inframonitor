@@ -55,7 +55,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.7";
+    private static final String VERSION = "1.0.8";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -429,11 +429,12 @@ public class InfraMonitorAgent {
 
     // ── Network scan (LAN discovery) ────────────────────────────────────────────
 
-    private static final int SCAN_HOST_TIMEOUT_MS = 400;
-    // Bounds the sweep so a misconfigured huge subnet (e.g. /8) cannot stall a scan for minutes.
-    private static final int SCAN_MAX_PREFIX_LENGTH = 22; // smallest network we scan in full (1024 hosts)
+    private static final int SCAN_HOST_TIMEOUT_MS = 250;
+    private static final int SCAN_NETWORK_BUDGET_MS = 4500;
+    // Bounds the active sweep so a misconfigured huge subnet (e.g. /8) only scans the local /24 window.
+    private static final int SCAN_MAX_PREFIX_LENGTH = 24;
     private static final ExecutorService scanExecutor = new ThreadPoolExecutor(
-            16, 128, 30L, TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>());
+            16, 64, 30L, TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>());
 
     private static void handleNetworkScan(WebSocket ws, String json) {
         String scanId = extractString(json, "id");
@@ -450,8 +451,13 @@ public class InfraMonitorAgent {
                 error = "No IPv4 LAN interfaces found on the agent host";
             }
             for (int i = 0; i < networks.size(); i++) {
+                long remainingMs = overallTimeoutMs - (System.currentTimeMillis() - start) - 1000;
+                if (remainingMs <= 500) {
+                    log("Network scan budget exhausted; returning partial result");
+                    break;
+                }
                 if (i > 0) networksJson.append(',');
-                networksJson.append(scanOneNetwork(networks.get(i), overallTimeoutMs));
+                networksJson.append(scanOneNetwork(networks.get(i), (int) Math.min(remainingMs, SCAN_NETWORK_BUDGET_MS)));
             }
         } catch (Exception e) {
             error = e.getClass().getSimpleName() + ": " + e.getMessage();
@@ -501,7 +507,7 @@ public class InfraMonitorAgent {
                 int prefix = ifAddr.getNetworkPrefixLength();
                 if (prefix <= 0 || prefix > 32) continue;
 
-                // Clamp very large networks down to a /24 around this host's address.
+                // Clamp every broad network down to a /24 around this host's address.
                 int scanPrefix = prefix < SCAN_MAX_PREFIX_LENGTH ? 24 : prefix;
                 if (scanPrefix < prefix) scanPrefix = prefix; // never widen beyond the real network
 
@@ -513,7 +519,59 @@ public class InfraMonitorAgent {
                         + " cidr=" + intToIp(network) + "/" + scanPrefix);
             }
         }
+        addDirectRouteNetworks(result);
         return result;
+    }
+
+    private static void addDirectRouteNetworks(List<ScanNetwork> result) {
+        if (System.getProperty("os.name").toLowerCase().contains("win")) return;
+        try {
+            ProcessBuilder pb = new ProcessBuilder("sh", "-c", "ip -4 route show scope link 2>/dev/null");
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            if (!process.waitFor(1200, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly();
+                return;
+            }
+            for (String line : new String(process.getInputStream().readAllBytes()).split("\\R")) {
+                addDirectRouteNetworkLine(result, line.trim());
+            }
+        } catch (Exception e) {
+            debug("Route network discovery failed: " + e.getMessage());
+        }
+    }
+
+    private static void addDirectRouteNetworkLine(List<ScanNetwork> result, String line) {
+        if (line.isBlank() || line.startsWith("default ")) return;
+        String[] parts = line.split("\\s+");
+        if (parts.length == 0 || !parts[0].contains("/")) return;
+
+        String cidr = parts[0];
+        String dev = "";
+        String src = "";
+        for (int i = 1; i < parts.length - 1; i++) {
+            if ("dev".equals(parts[i])) dev = parts[i + 1];
+            if ("src".equals(parts[i])) src = parts[i + 1];
+        }
+        if (src.isBlank()) return;
+
+        try {
+            String[] c = cidr.split("/", 2);
+            int routePrefix = Integer.parseInt(c[1]);
+            if (routePrefix <= 0 || routePrefix > 32) return;
+            int scanPrefix = routePrefix < SCAN_MAX_PREFIX_LENGTH ? SCAN_MAX_PREFIX_LENGTH : routePrefix;
+            int ip = ipToInt(src);
+            int mask = scanPrefix == 0 ? 0 : (int) (0xFFFFFFFFL << (32 - scanPrefix));
+            String baseIp = intToIp(ip & mask);
+            String key = baseIp + "/" + scanPrefix;
+            for (ScanNetwork existing : result) {
+                if (existing.cidr().equals(key)) return;
+            }
+            result.add(new ScanNetwork(dev.isBlank() ? "route" : dev, baseIp, src, scanPrefix));
+            debug("Network scan direct route localIp=" + src + " cidr=" + key);
+        } catch (Exception ignored) {
+            // Ignore route lines that don't look like IPv4 CIDR + src.
+        }
     }
 
     private static String scanOneNetwork(ScanNetwork net, int timeoutMs) {
@@ -525,12 +583,17 @@ public class InfraMonitorAgent {
         Map<String, Long> discovered = new java.util.concurrent.ConcurrentHashMap<>();
         discovered.put(net.localIp, 0L);
 
+        Map<String, String> arpHosts = lookupArpTable(network, net.prefixLength);
+        for (String ip : arpHosts.keySet()) {
+            discovered.putIfAbsent(ip, 0L);
+        }
+
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (long h = 1; h <= totalHosts; h++) {
             int candidate = network + (int) h;
             String ip = intToIp(candidate);
             futures.add(CompletableFuture.runAsync(() -> {
-                long rtt = pingHost(ip, SCAN_HOST_TIMEOUT_MS);
+                long rtt = pingHostQuiet(ip, SCAN_HOST_TIMEOUT_MS);
                 if (rtt >= 0) {
                     discovered.put(ip, rtt);
                 }
@@ -544,7 +607,7 @@ public class InfraMonitorAgent {
             debug("Network scan ping sweep timed out/partial on " + net.cidr() + ": " + e.getMessage());
         }
 
-        Map<String, String> arpHosts = lookupArpTable(network, net.prefixLength);
+        arpHosts = lookupArpTable(network, net.prefixLength);
         for (String ip : arpHosts.keySet()) {
             discovered.putIfAbsent(ip, 0L);
         }
@@ -864,6 +927,14 @@ public class InfraMonitorAgent {
      * actual network latency to the target).
      */
     private static long pingHost(String target, int timeoutMs) {
+        return pingHost(target, timeoutMs, true);
+    }
+
+    private static long pingHostQuiet(String target, int timeoutMs) {
+        return pingHost(target, timeoutMs, false);
+    }
+
+    private static long pingHost(String target, int timeoutMs, boolean verbose) {
         try {
             boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
             java.util.List<String> command;
@@ -879,24 +950,26 @@ public class InfraMonitorAgent {
                 // - -4: IPv4 only (faster)
                 // Some systems may not support all flags, but they're additive/safe to ignore.
 
-                int timeoutSec = Math.max(1, (timeoutMs + 500) / 1000);  // Round up
+                int timeoutSec = Math.max(1, (timeoutMs + 500) / 1000);  // OS flag is coarse; Java waitFor is the real cap.
                 command = java.util.List.of("ping", "-c", "1", "-n", "-W", String.valueOf(timeoutSec), "-4", target);
             }
 
-            debug("PING command: " + String.join(" ", command));
+            if (verbose) debug("PING command: " + String.join(" ", command));
             long processStartNs = System.nanoTime();
             ProcessBuilder pb = new ProcessBuilder(command);
             pb.redirectErrorStream(true);
             Process process = pb.start();
 
             // Java's waitFor() is the actual timeout guarantee (not the OS ping flags).
-            boolean finished = process.waitFor(timeoutMs + 1000, TimeUnit.MILLISECONDS);
+            boolean finished = process.waitFor(Math.max(250, timeoutMs + 250), TimeUnit.MILLISECONDS);
             long processElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - processStartNs);
             if (!finished) {
                 process.destroyForcibly();
                 process.waitFor(500, TimeUnit.MILLISECONDS);
-                debug("PING timed out after processElapsedMs=" + processElapsedMs
-                        + " javaTimeoutMs=" + (timeoutMs + 1000));
+                if (verbose) {
+                    debug("PING timed out after processElapsedMs=" + processElapsedMs
+                            + " javaTimeoutMs=" + Math.max(250, timeoutMs + 250));
+                }
                 return -1;  // Timeout exceeded
             }
 
@@ -905,10 +978,12 @@ public class InfraMonitorAgent {
             // Require both exit code 0 AND a TTL in the response — on Windows, "ping"
             // can return 0 even for "Destination host unreachable" replies.
             boolean hasTtl = output.toLowerCase().contains("ttl=");
-            debug("PING finished processElapsedMs=" + processElapsedMs
-                    + " exitCode=" + exitCode
-                    + " hasTtl=" + hasTtl
-                    + " output=\"" + compact(output) + "\"");
+            if (verbose) {
+                debug("PING finished processElapsedMs=" + processElapsedMs
+                        + " exitCode=" + exitCode
+                        + " hasTtl=" + hasTtl
+                        + " output=\"" + compact(output) + "\"");
+            }
             if (exitCode != 0 || !hasTtl) {
                 return -1;
             }
@@ -916,20 +991,20 @@ public class InfraMonitorAgent {
             java.util.regex.Matcher m = PING_RTT_PATTERN.matcher(output);
             if (m.find()) {
                 long parsed = (long) Double.parseDouble(m.group(1));
-                debug("PING parsedRttMs=" + parsed);
+                if (verbose) debug("PING parsedRttMs=" + parsed);
                 return parsed;
             }
             // TTL present but couldn't parse RTT (unexpected format) — treat as 0ms rather
             // than fabricating a number from wall-clock time.
-            debug("PING had TTL but RTT could not be parsed; returning 0ms");
+            if (verbose) debug("PING had TTL but RTT could not be parsed; returning 0ms");
             return 0;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            debug("PING interrupted: " + e.getMessage());
+            if (verbose) debug("PING interrupted: " + e.getMessage());
             return -1;
         } catch (Exception e) {
             // DNS resolution failed, network error, etc.
-            debug("PING failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            if (verbose) debug("PING failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return -1;
         }
     }
