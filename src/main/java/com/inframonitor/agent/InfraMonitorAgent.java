@@ -18,6 +18,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -54,7 +55,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.4";
+    private static final String VERSION = "1.0.5";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -281,6 +282,9 @@ public class InfraMonitorAgent {
             case "CHECK":
                 handleCheck(ws, json);
                 break;
+            case "NETWORK_SCAN":
+                handleNetworkScan(ws, json);
+                break;
             case "CONFIG":
                 handleConfig(json);
                 break;
@@ -423,6 +427,356 @@ public class InfraMonitorAgent {
         log("Result: " + result.status + " (" + result.latencyMs + "ms) " + result.message);
     }
 
+    // ── Network scan (LAN discovery) ────────────────────────────────────────────
+
+    private static final int SCAN_HOST_TIMEOUT_MS = 400;
+    // Bounds the sweep so a misconfigured huge subnet (e.g. /8) cannot stall a scan for minutes.
+    private static final int SCAN_MAX_PREFIX_LENGTH = 22; // smallest network we scan in full (1024 hosts)
+    private static final ExecutorService scanExecutor = new ThreadPoolExecutor(
+            16, 128, 30L, TimeUnit.SECONDS, new java.util.concurrent.LinkedBlockingQueue<>());
+
+    private static void handleNetworkScan(WebSocket ws, String json) {
+        String scanId = extractString(json, "id");
+        String toStr = extractString(json, "timeoutMs");
+        int overallTimeoutMs = (toStr != null && !toStr.equals("null")) ? Integer.parseInt(toStr) : 20000;
+
+        log("Starting network scan id=" + scanId);
+        long start = System.currentTimeMillis();
+        StringBuilder networksJson = new StringBuilder();
+        String error = null;
+        try {
+            List<ScanNetwork> networks = localScanNetworks();
+            if (networks.isEmpty()) {
+                error = "No IPv4 LAN interfaces found on the agent host";
+            }
+            for (int i = 0; i < networks.size(); i++) {
+                if (i > 0) networksJson.append(',');
+                networksJson.append(scanOneNetwork(networks.get(i), overallTimeoutMs));
+            }
+        } catch (Exception e) {
+            error = e.getClass().getSimpleName() + ": " + e.getMessage();
+            log("Network scan failed: " + error);
+        }
+        long elapsed = System.currentTimeMillis() - start;
+        log("Network scan id=" + scanId + " finished in " + elapsed + "ms");
+
+        sendJson(ws, "{\"type\":\"NETWORK_SCAN_RESULT\",\"id\":\"" + jsonEscape(scanId) +
+                "\",\"durationMs\":" + elapsed +
+                (error != null ? ",\"error\":\"" + jsonEscape(error) + "\"" : "") +
+                ",\"networks\":[" + networksJson + "]}");
+    }
+
+    /** A local IPv4 network reachable from one of this host's interfaces. */
+    private static final class ScanNetwork {
+        final String interfaceName;
+        final String baseIp;     // network address, e.g. 192.168.1.0
+        final String localIp;
+        final int prefixLength;  // CIDR prefix, capped at SCAN_MAX_PREFIX_LENGTH for the sweep
+
+        ScanNetwork(String interfaceName, String baseIp, String localIp, int prefixLength) {
+            this.interfaceName = interfaceName;
+            this.baseIp = baseIp;
+            this.localIp = localIp;
+            this.prefixLength = prefixLength;
+        }
+
+        String cidr() { return baseIp + "/" + prefixLength; }
+    }
+
+    /**
+     * Enumerates this host's up, non-loopback, non-virtual IPv4 interfaces and the
+     * networks they're attached to. Large networks (prefix < /22) are clamped to the
+     * /24 containing this host's address so the sweep stays fast.
+     */
+    private static List<ScanNetwork> localScanNetworks() throws Exception {
+        List<ScanNetwork> result = new ArrayList<>();
+        java.util.Enumeration<java.net.NetworkInterface> ifaces = java.net.NetworkInterface.getNetworkInterfaces();
+        while (ifaces.hasMoreElements()) {
+            java.net.NetworkInterface iface = ifaces.nextElement();
+            if (!iface.isUp() || iface.isLoopback() || iface.isVirtual()) continue;
+
+            for (java.net.InterfaceAddress ifAddr : iface.getInterfaceAddresses()) {
+                InetAddress addr = ifAddr.getAddress();
+                if (!(addr instanceof java.net.Inet4Address)) continue;
+                int prefix = ifAddr.getNetworkPrefixLength();
+                if (prefix <= 0 || prefix > 32) continue;
+
+                // Clamp very large networks down to a /24 around this host's address.
+                int scanPrefix = prefix < SCAN_MAX_PREFIX_LENGTH ? 24 : prefix;
+                if (scanPrefix < prefix) scanPrefix = prefix; // never widen beyond the real network
+
+                int ip = ipToInt(addr.getHostAddress());
+                int mask = scanPrefix == 0 ? 0 : (int) (0xFFFFFFFFL << (32 - scanPrefix));
+                int network = ip & mask;
+                result.add(new ScanNetwork(iface.getName(), intToIp(network), addr.getHostAddress(), scanPrefix));
+                debug("Network scan interface " + iface.getName() + " localIp=" + addr.getHostAddress()
+                        + " cidr=" + intToIp(network) + "/" + scanPrefix);
+            }
+        }
+        return result;
+    }
+
+    private static String scanOneNetwork(ScanNetwork net, int timeoutMs) {
+        int network = ipToInt(net.baseIp);
+        int hostBits = 32 - net.prefixLength;
+        long totalHosts = hostBits >= 31 ? 1 : (1L << hostBits) - 2; // exclude network+broadcast
+        totalHosts = Math.max(totalHosts, 1);
+
+        Map<String, Long> discovered = new java.util.concurrent.ConcurrentHashMap<>();
+        discovered.put(net.localIp, 0L);
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (long h = 1; h <= totalHosts; h++) {
+            int candidate = network + (int) h;
+            String ip = intToIp(candidate);
+            futures.add(CompletableFuture.runAsync(() -> {
+                long rtt = pingHost(ip, SCAN_HOST_TIMEOUT_MS);
+                if (rtt >= 0) {
+                    discovered.put(ip, rtt);
+                }
+            }, scanExecutor));
+        }
+
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(Math.max(3000, timeoutMs), TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            debug("Network scan ping sweep timed out/partial on " + net.cidr() + ": " + e.getMessage());
+        }
+
+        Map<String, String> arpHosts = lookupArpTable(network, net.prefixLength);
+        for (String ip : arpHosts.keySet()) {
+            discovered.putIfAbsent(ip, 0L);
+        }
+
+        List<String> ips = new ArrayList<>(discovered.keySet());
+        ips.sort(InfraMonitorAgent::compareIpv4);
+
+        StringBuilder hostsJson = new StringBuilder();
+        boolean first = true;
+        for (String ip : ips) {
+            try {
+                String hostJson = hostJson(ip, discovered.getOrDefault(ip, 0L), arpHosts.get(ip));
+                if (hostJson != null) {
+                    if (!first) hostsJson.append(',');
+                    hostsJson.append(hostJson);
+                    first = false;
+                }
+            } catch (Exception ignored) {
+                // timeout/unreachable — skip this host
+            }
+        }
+
+        log("Network scan " + net.cidr() + " found " + ips.size() + " host(s)");
+        return "{\"cidr\":\"" + jsonEscape(net.cidr()) +
+                "\",\"interfaceName\":\"" + jsonEscape(net.interfaceName) +
+                "\",\"hosts\":[" + hostsJson + "]}";
+    }
+
+    private static String hostJson(String ip, long latencyMs) {
+        return hostJson(ip, latencyMs, null);
+    }
+
+    private static String hostJson(String ip, long latencyMs, String knownMac) {
+        String mac = knownMac != null && !knownMac.isBlank() ? knownMac : lookupArpMac(ip);
+        String hostname = resolveHostnameQuiet(ip);
+        String vendor = mac != null ? lookupOuiVendor(mac) : "Unknown";
+        String deviceType = classifyDeviceType(vendor, hostname);
+        return "{\"ip\":\"" + jsonEscape(ip) +
+                "\",\"mac\":\"" + jsonEscape(mac != null ? mac : "") +
+                "\",\"vendor\":\"" + jsonEscape(vendor) +
+                "\",\"deviceType\":\"" + jsonEscape(deviceType) +
+                "\",\"hostname\":\"" + jsonEscape(hostname != null ? hostname : "") +
+                "\",\"latencyMs\":" + latencyMs + "}";
+    }
+
+    // Keyword groups used to classify a discovered host beyond plain "computer", since a LAN
+    // sweep also turns up routers/APs/switches, printers, cameras, phones, VMs and IoT/SBCs —
+    // each needing different handling in the UI (e.g. routers shouldn't be flagged as rogue hosts).
+    private static final String[] NETWORK_GEAR_VENDORS = {
+            "ubiquiti", "tp-link", "d-link", "netgear", "cisco", "asustek", "mikrotik", "huawei"
+    };
+    private static final String[] PRINTER_VENDORS = {"brother", "hp", "canon", "epson", "lexmark"};
+    private static final String[] MOBILE_VENDORS = {"apple", "samsung", "xiaomi", "huawei"};
+    private static final String[] VM_VENDORS = {"vmware", "virtualbox", "hyper-v", "microsoft hyper-v"};
+    private static final String[] IOT_VENDORS = {"raspberry pi"};
+
+    /**
+     * Best-effort classification combining vendor (OUI) and hostname keywords. Hostname hints
+     * take priority since they're more specific than a generic vendor match (e.g. a Brother
+     * vendor MAC with hostname "office-router" is unusual, but a hostname is rarely wrong).
+     */
+    private static String classifyDeviceType(String vendor, String hostname) {
+        String v = vendor != null ? vendor.toLowerCase() : "";
+        String h = hostname != null ? hostname.toLowerCase() : "";
+
+        if (containsAny(h, "router", "gateway", "ap-", "access-point", "accesspoint", "switch", "modem")) {
+            return "Network Equipment";
+        }
+        if (containsAny(h, "printer", "print-")) return "Printer";
+        if (containsAny(h, "cam", "camera", "nvr", "dvr")) return "Camera";
+        if (containsAny(h, "iphone", "android", "phone", "mobile")) return "Mobile Device";
+        if (containsAny(h, "desktop", "laptop", "pc-", "workstation")) return "Computer";
+
+        if (containsAny(v, NETWORK_GEAR_VENDORS)) return "Network Equipment";
+        if (containsAny(v, PRINTER_VENDORS)) return "Printer";
+        if (containsAny(v, VM_VENDORS)) return "Virtual Machine";
+        if (containsAny(v, IOT_VENDORS)) return "IoT / Single-board Computer";
+        if (containsAny(v, MOBILE_VENDORS)) return "Mobile Device";
+        if (containsAny(v, "dell", "lenovo", "intel", "sony")) return "Computer";
+
+        return "Unknown";
+    }
+
+    private static boolean containsAny(String haystack, String... needles) {
+        for (String n : needles) {
+            if (haystack.contains(n)) return true;
+        }
+        return false;
+    }
+
+    private static String resolveHostnameQuiet(String ip) {
+        try {
+            CompletableFuture<String> f = CompletableFuture.supplyAsync(() -> {
+                try {
+                    InetAddress addr = InetAddress.getByName(ip);
+                    String host = addr.getCanonicalHostName();
+                    return host.equals(ip) ? null : host; // no PTR record resolved
+                } catch (Exception e) {
+                    return null;
+                }
+            }, scanExecutor);
+            return f.get(800, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static final java.util.regex.Pattern MAC_PATTERN = java.util.regex.Pattern.compile(
+            "([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}");
+    private static final java.util.regex.Pattern IPV4_PATTERN = java.util.regex.Pattern.compile(
+            "\\b((?:\\d{1,3}\\.){3}\\d{1,3})\\b");
+
+    private static Map<String, String> lookupArpTable(int network, int prefixLength) {
+        Map<String, String> hosts = new LinkedHashMap<>();
+        try {
+            boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+            java.util.List<String> command = isWindows
+                    ? java.util.List.of("arp", "-a")
+                    : java.util.List.of("sh", "-c", "ip neigh show 2>/dev/null || arp -an");
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            boolean finished = process.waitFor(1500, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                return hosts;
+            }
+            parseArpOutput(new String(process.getInputStream().readAllBytes()), network, prefixLength, hosts);
+        } catch (Exception e) {
+            debug("ARP table lookup failed: " + e.getMessage());
+        }
+        return hosts;
+    }
+
+    private static void parseArpOutput(String output, int network, int prefixLength, Map<String, String> hosts) {
+        for (String line : output.split("\\R")) {
+            java.util.regex.Matcher ipMatcher = IPV4_PATTERN.matcher(line);
+            java.util.regex.Matcher macMatcher = MAC_PATTERN.matcher(line);
+            if (!ipMatcher.find() || !macMatcher.find()) continue;
+            String ip = ipMatcher.group(1);
+            if (!isIpInNetwork(ip, network, prefixLength)) continue;
+            String mac = macMatcher.group().toUpperCase().replace('-', ':');
+            if ("00:00:00:00:00:00".equals(mac)) continue;
+            hosts.put(ip, mac);
+        }
+    }
+
+    private static boolean isIpInNetwork(String ip, int network, int prefixLength) {
+        try {
+            int value = ipToInt(ip);
+            int mask = prefixLength == 0 ? 0 : (int) (0xFFFFFFFFL << (32 - prefixLength));
+            return (value & mask) == network;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static int compareIpv4(String a, String b) {
+        return Integer.compareUnsigned(ipToInt(a), ipToInt(b));
+    }
+
+    /** Reads the OS ARP/neighbor cache to find the MAC address already learned for an IP. */
+    private static String lookupArpMac(String ip) {
+        try {
+            boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+            java.util.List<String> command = isWindows
+                    ? java.util.List.of("arp", "-a", ip)
+                    : java.util.List.of("sh", "-c", "ip neigh show " + ip + " 2>/dev/null || arp -n " + ip);
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            boolean finished = process.waitFor(1000, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                return null;
+            }
+            String output = new String(process.getInputStream().readAllBytes());
+            java.util.regex.Matcher m = MAC_PATTERN.matcher(output);
+            if (m.find()) {
+                return m.group().toUpperCase().replace('-', ':');
+            }
+            return null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static volatile Map<String, String> ouiVendorTable;
+
+    /** Best-effort vendor lookup from the MAC's OUI prefix (first 3 octets). */
+    private static String lookupOuiVendor(String mac) {
+        Map<String, String> table = ouiVendorTable;
+        if (table == null) {
+            table = loadOuiVendorTable();
+            ouiVendorTable = table;
+        }
+        String prefix = mac.replace(":", "").substring(0, Math.min(6, mac.replace(":", "").length())).toUpperCase();
+        return table.getOrDefault(prefix, "Unknown");
+    }
+
+    private static Map<String, String> loadOuiVendorTable() {
+        Map<String, String> table = new java.util.HashMap<>();
+        try (java.io.InputStream in = InfraMonitorAgent.class.getResourceAsStream("/oui-vendors.txt")) {
+            if (in == null) return table;
+            for (String line : new String(in.readAllBytes(), StandardCharsets.UTF_8).split("\\R")) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                int idx = line.indexOf('=');
+                if (idx <= 0) continue;
+                table.put(line.substring(0, idx).trim().toUpperCase(), line.substring(idx + 1).trim());
+            }
+        } catch (Exception e) {
+            debug("Could not load OUI vendor table: " + e.getMessage());
+        }
+        return table;
+    }
+
+    private static int ipToInt(String ip) {
+        String[] parts = ip.split("\\.");
+        int result = 0;
+        for (String part : parts) {
+            result = (result << 8) | (Integer.parseInt(part) & 0xFF);
+        }
+        return result;
+    }
+
+    private static String intToIp(int ip) {
+        return ((ip >> 24) & 0xFF) + "." + ((ip >> 16) & 0xFF) + "." + ((ip >> 8) & 0xFF) + "." + (ip & 0xFF);
+    }
+
     // ── Local check execution ─────────────────────────────────────────────────
 
     private static CheckResult executeCheck(String monitorType, String target, Integer port,
@@ -469,6 +823,8 @@ public class InfraMonitorAgent {
                     int p = port != null ? port : 5060;
                     return checkSipAgent(target, p, timeoutMs);
                 }
+                case "TRACEROUTE":
+                    return traceroute(target, timeoutMs);
                 default:
                     return new CheckResult("UNKNOWN", 0, "Unsupported monitor type: " + monitorType);
             }
@@ -575,6 +931,71 @@ public class InfraMonitorAgent {
             // DNS resolution failed, network error, etc.
             debug("PING failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             return -1;
+        }
+    }
+
+    // Matches a hop line's RTT, e.g. "1  2 ms  1 ms  1 ms  10.0.0.1" (Windows) or
+    // "1  10.0.0.1  0.456 ms  0.398 ms  0.412 ms" (Linux/Mac).
+    private static final java.util.regex.Pattern TRACEROUTE_HOP_PATTERN = java.util.regex.Pattern.compile(
+            "^\\s*(\\d+)\\s");
+
+    /**
+     * Runs the OS traceroute/tracert binary and summarizes the hop count and total time.
+     * Unlike PING, a single RTT number doesn't capture a multi-hop route, so the message
+     * carries the hop count and the full path is returned so the UI can show it as a log.
+     */
+    // Hard ceiling independent of the requested timeoutMs: a multi-hop route with several
+    // filtered/unreachable hops can otherwise run for minutes (maxHops × probes-per-hop ×
+    // per-hop timeout). This keeps the agent's reply comfortably inside the backend's
+    // end-to-end deadline for TRACEROUTE checks (see RemoteAgentController / AgentRegistryService).
+    private static final int TRACEROUTE_MAX_HOPS = 16;
+    private static final int TRACEROUTE_PER_HOP_TIMEOUT_MS = 1200;
+    private static final long TRACEROUTE_OVERALL_TIMEOUT_MS = 20000L;
+
+    private static CheckResult traceroute(String target, int timeoutMs) {
+        long start = System.currentTimeMillis();
+        try {
+            boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+            java.util.List<String> command = isWindows
+                    ? java.util.List.of("tracert", "-d", "-h", String.valueOf(TRACEROUTE_MAX_HOPS),
+                            "-w", String.valueOf(TRACEROUTE_PER_HOP_TIMEOUT_MS), target)
+                    : java.util.List.of("traceroute", "-n", "-m", String.valueOf(TRACEROUTE_MAX_HOPS),
+                            "-w", "1", target);
+
+            debug("TRACEROUTE command: " + String.join(" ", command));
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            boolean finished = process.waitFor(TRACEROUTE_OVERALL_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                process.waitFor(500, TimeUnit.MILLISECONDS);
+                long latency = System.currentTimeMillis() - start;
+                return new CheckResult("DOWN", latency, "Traceroute timed out after " + latency + "ms");
+            }
+
+            String output = new String(process.getInputStream().readAllBytes());
+            long latency = System.currentTimeMillis() - start;
+            int hopCount = 0;
+            for (String line : output.split("\\R")) {
+                if (TRACEROUTE_HOP_PATTERN.matcher(line).find()) hopCount++;
+            }
+
+            if (hopCount == 0) {
+                return new CheckResult("DOWN", latency, "No route found to " + target);
+            }
+            String trimmedOutput = output.length() > 2000 ? output.substring(0, 2000) + "..." : output;
+            return new CheckResult("UP", latency,
+                    "Traceroute OK — " + hopCount + " hop(s) in " + latency + "ms\n" + trimmedOutput);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            long latency = System.currentTimeMillis() - start;
+            return new CheckResult("DOWN", latency, "Traceroute interrupted");
+        } catch (Exception e) {
+            long latency = System.currentTimeMillis() - start;
+            return new CheckResult("DOWN", latency,
+                    "Traceroute error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
         }
     }
 
