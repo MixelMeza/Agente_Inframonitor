@@ -55,7 +55,7 @@ import java.security.cert.X509Certificate;
  */
 public class InfraMonitorAgent {
 
-    private static final String VERSION = "1.0.5";
+    private static final String VERSION = "1.0.6";
     private static final int DEFAULT_TIMEOUT_MS = 5000;
     private static final int MIN_TIMEOUT_MS = 2000;
     private static final int MAX_TIMEOUT_MS = 8000;  // Reduced from 10s to prevent runaway delays
@@ -1292,8 +1292,58 @@ public class InfraMonitorAgent {
         if (valStart >= json.length()) return null;
         char first = json.charAt(valStart);
         if (first == '"') {
-            int end = json.indexOf('"', valStart + 1);
-            return end < 0 ? null : json.substring(valStart + 1, end);
+            StringBuilder out = new StringBuilder();
+            boolean escaped = false;
+            for (int i = valStart + 1; i < json.length(); i++) {
+                char c = json.charAt(i);
+                if (escaped) {
+                    switch (c) {
+                        case 'n':
+                            out.append('\n');
+                            break;
+                        case 'r':
+                            out.append('\r');
+                            break;
+                        case 't':
+                            out.append('\t');
+                            break;
+                        case 'b':
+                            out.append('\b');
+                            break;
+                        case 'f':
+                            out.append('\f');
+                            break;
+                        case '"':
+                        case '\\':
+                        case '/':
+                            out.append(c);
+                            break;
+                        case 'u':
+                            if (i + 4 < json.length()) {
+                                try {
+                                    out.append((char) Integer.parseInt(json.substring(i + 1, i + 5), 16));
+                                    i += 4;
+                                } catch (NumberFormatException e) {
+                                    out.append("\\u");
+                                }
+                            } else {
+                                out.append("\\u");
+                            }
+                            break;
+                        default:
+                            out.append(c);
+                            break;
+                    }
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    return out.toString();
+                } else {
+                    out.append(c);
+                }
+            }
+            return null;
         }
         // number or null/true/false
         int end = valStart;
@@ -1440,12 +1490,25 @@ public class InfraMonitorAgent {
 
         String shellName() {
             if (requestedShell != null && !requestedShell.isBlank()) return requestedShell;
-            return isWindows() ? "cmd.exe" : "/bin/sh";
+            if (isWindows()) return "cmd.exe";
+            return Files.isExecutable(Path.of("/bin/bash")) ? "/bin/bash" : "/bin/sh";
+        }
+
+        java.util.List<String> shellCommand() {
+            if (requestedShell != null && !requestedShell.isBlank()) {
+                return java.util.List.of(requestedShell);
+            }
+            if (isWindows()) {
+                return java.util.List.of("cmd.exe");
+            }
+            String shell = shellName();
+            return java.util.List.of(shell, "-i");
         }
 
         void start() throws Exception {
-            ProcessBuilder pb = new ProcessBuilder(shellName());
+            ProcessBuilder pb = new ProcessBuilder(shellCommand());
             pb.redirectErrorStream(false);
+            pb.environment().putIfAbsent("TERM", "xterm-256color");
             process = pb.start();
 
             Thread stdout = new Thread(() -> readLoop(process.getInputStream(), "stdout"),
